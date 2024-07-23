@@ -68,6 +68,14 @@ impl Page {
     pub fn get_raw_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
+
+    pub fn write_slice(&mut self, offset: usize, slice: &[u8]) -> Result<(), &'static str> {
+        if offset + slice.len() > self.0.len() {
+            return Err("Slice exceeds page size");
+        }
+        self.0[offset..offset + slice.len()].copy_from_slice(slice);
+        Ok(())
+    }
 }
 
 struct BasePageHeader {

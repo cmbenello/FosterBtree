@@ -8,7 +8,7 @@ pub mod write_ahead_log;
 mod file_manager;
 mod heap_page;
 mod logger;
-mod page;
+pub mod page;
 mod rwlatch;
 
 use logger::log;
@@ -20,3 +20,4 @@ pub mod prelude {
     pub use crate::page::*;
     pub use crate::txn_storage::prelude::*;
 }
+

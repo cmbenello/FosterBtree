@@ -1,8 +1,9 @@
-use append_only_store::AppendOnlyStoreError;
+pub mod append_only_store;
+
+pub use append_only_store::{AppendOnlyStore, AppendOnlyStoreError, AppendOnlyStoreScanner};
 use fbt::TreeStatus;
 use prelude::PagedHashMapError;
 
-pub mod append_only_store;
 pub mod fbt;
 pub mod hashindex;
 

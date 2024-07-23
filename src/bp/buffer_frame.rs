@@ -217,6 +217,15 @@ impl<'a, T: EvictionPolicy> FrameWriteGuard<'a, T> {
         self.buffer_frame.evict_info.write().unwrap().reset();
         self.page_key_mut().take();
     }
+
+    pub fn write_slice(&mut self, offset: usize, slice: &[u8]) -> Result<(), &'static str> {
+        let page = unsafe { &mut *self.buffer_frame.page.get() };
+        if offset + slice.len() > page.len() {
+            return Err("Slice exceeds page size");
+        }
+        page[offset..offset + slice.len()].copy_from_slice(slice);
+        Ok(())
+    }
 }
 
 impl<'a, T: EvictionPolicy> Drop for FrameWriteGuard<'a, T> {

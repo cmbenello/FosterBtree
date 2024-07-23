@@ -1,6 +1,6 @@
 mod append_only_page;
-
 use append_only_page::AppendOnlyPage;
+
 use std::{
     marker::PhantomData,
     sync::{atomic::AtomicUsize, Arc, Mutex},

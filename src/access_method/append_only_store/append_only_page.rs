@@ -9,6 +9,7 @@
 
 use crate::prelude::{Page, PageId, AVAILABLE_PAGE_SIZE};
 
+pub use crate::access_method::append_only_store::{AppendOnlyStore, AppendOnlyStoreError, AppendOnlyStoreScanner};
 mod slot {
     pub const SLOT_SIZE: usize = 6;
 
