@@ -179,6 +179,19 @@ impl<T: MemPool> SortedRunStore<T> {
         }
         total_tuples
     }
+
+    /// Returns the total number of pages used in the `SortedRunStore`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let sorted_run_store = SortedRunStore::new(/* parameters */);
+    /// let total_pages = sorted_run_store.num_pages();
+    /// println!("Total pages used: {}", total_pages);
+    /// ```
+    pub fn num_pages(&self) -> usize {
+        self.page_ids.len()
+    }
 }
 
 /// Iterator for scanning over a range of key-value pairs in a `SortedRunStore`.
