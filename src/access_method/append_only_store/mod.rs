@@ -2,7 +2,7 @@ mod append_only_page;
 
 use append_only_page::AppendOnlyPage;
 use std::{
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -66,11 +66,15 @@ pub struct AppendOnlyStore<T: MemPool> {
     pub last_key: Mutex<PageFrameKey>, // Variable
     pub mem_pool: Arc<T>,
     stats: RuntimeStats, // Stats are not durable
+
+    // Tracking page indexes useful for reading ahead
+    pages: RwLock<Vec<(PageId, u32, u32)>>, // (page_id, frame_id, slot_count)
+
 }
 
 impl<T: MemPool> AppendOnlyStore<T> {
     pub fn new(c_key: ContainerKey, mem_pool: Arc<T>) -> Self {
-        // Root page contains the page id and frame id of the last page in the chain.
+        // Create and initialize the root page
         let mut root_page = mem_pool.create_new_page_for_write(c_key).unwrap();
         root_page.init();
         let root_key = {
@@ -79,6 +83,7 @@ impl<T: MemPool> AppendOnlyStore<T> {
             PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
         };
 
+        // Create and initialize the first data page
         let mut data_page = mem_pool.create_new_page_for_write(c_key).unwrap();
         data_page.init();
         let data_key = {
@@ -87,10 +92,10 @@ impl<T: MemPool> AppendOnlyStore<T> {
             PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
         };
 
-        // Set the next page of the root page to the data page.
+        // Link root page to the first data page
         root_page.set_next_page(data_page.get_id(), data_page.frame_id());
 
-        // Set the last page id and frame id to the root page.
+        // Serialize the first data page's info into the root page
         let data_key_bytes = {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&data_page.get_id().to_be_bytes());
@@ -99,12 +104,16 @@ impl<T: MemPool> AppendOnlyStore<T> {
         };
         assert!(root_page.append(&[], &data_key_bytes));
 
+        // Initialize the pages index with the first data page
+        let pages = RwLock::new(vec![(data_page.get_id(), data_page.frame_id(), data_page.slot_count())]);
+
         AppendOnlyStore {
             c_key,
             root_key,
             last_key: Mutex::new(data_key),
             mem_pool: mem_pool.clone(),
             stats: RuntimeStats::new(),
+            pages,
         }
     }
 
@@ -118,6 +127,8 @@ impl<T: MemPool> AppendOnlyStore<T> {
             let frame_id = u32::from_be_bytes(val[4..8].try_into().unwrap());
             PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
         };
+        // let pages = RwLock::new(vec![(data_page.get_id(), data_page.frame_id(), data_page.slot_count())]); //xtx figure out
+        let pages = RwLock::new(Vec::new());
 
         AppendOnlyStore {
             c_key,
@@ -125,6 +136,7 @@ impl<T: MemPool> AppendOnlyStore<T> {
             last_key: Mutex::new(last_key),
             mem_pool: mem_pool.clone(),
             stats: RuntimeStats::new(),
+            pages,
         }
     }
 
@@ -192,23 +204,28 @@ impl<T: MemPool> AppendOnlyStore<T> {
         let mut last_key = self.last_key.lock().unwrap();
         let mut last_page = self.write_page(&last_key);
 
-        // Try to insert into the last page. If the page is full, create a new page and append to it.
+        // Try to append to the last page
         if last_page.append(key, value) {
+            // Update the slot count in the pages index
+            let slot_count = last_page.slot_count();
+            let mut pages = self.pages.write().unwrap();
+            if let Some(last_entry) = pages.last_mut() {
+                last_entry.2 = slot_count;
+            }
             Ok(())
         } else {
-            // New page is created.
-            // The new page's page_id and frame_id are written to last page and the root page.
+            // Page overflow: create a new page
             let mut new_page = self.mem_pool.create_new_page_for_write(self.c_key).unwrap();
             new_page.init();
 
             let page_id = new_page.get_id();
             let frame_id = new_page.frame_id();
 
-            // Set the next page of the last page to the new page.
+            // Link the last page to the new page
             last_page.set_next_page(page_id, frame_id);
-            drop(last_page);
+            drop(last_page); // Release the lock on the last page
 
-            // Set the last page id and frame id to the root page.
+            // Update the root page's next page info
             let new_key_bytes = {
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&page_id.to_be_bytes());
@@ -217,15 +234,21 @@ impl<T: MemPool> AppendOnlyStore<T> {
             };
             let mut root_page = self.write_page(&self.root_key);
             root_page.get_mut_val(0).copy_from_slice(&new_key_bytes);
-            drop(root_page);
+            drop(root_page); // Release the lock on the root page
 
             self.stats.inc_num_pages();
 
-            // Set the in-memory last key to the new page.
+            // Update the in-memory last key to the new page
             let new_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
             *last_key = new_key;
 
+            // Append the key-value pair to the new page
             assert!(new_page.append(key, value));
+
+            // Add the new page to the pages index
+            let mut pages = self.pages.write().unwrap();
+            pages.push((page_id, frame_id, new_page.slot_count()));
+
             Ok(())
         }
     }
@@ -239,6 +262,28 @@ impl<T: MemPool> AppendOnlyStore<T> {
             current_slot_id: 0,
         }
     }
+
+    pub fn get_slot_at(&self, index: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+        let pages = self.pages.read().unwrap();
+        let mut remaining = index;
+
+        //xtx update for binary search maybe?
+        for &(page_id, frame_id, slot_count) in pages.iter() {
+            if remaining < slot_count {
+                // Found the target page and slot
+                let page_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
+                let page = self.read_page(page_key);
+                let (key, value) = page.get(remaining as u32);
+                return Some((key.to_vec(), value.to_vec()));
+            } else {
+                remaining -= slot_count;
+            }
+        }
+
+        // Index out of bounds
+        None
+    }
+
 }
 
 pub struct AppendOnlyStoreScanner<T: MemPool> {
@@ -334,6 +379,43 @@ impl<T: MemPool> Iterator for AppendOnlyStoreScanner<T> {
                 }
             }
         }
+    }
+}
+
+
+pub struct AppendOnlyStoreRangeIter<M: MemPool> {
+    store: Arc<AppendOnlyStore<M>>,
+    start_index: u32,
+    end_index: u32,
+    current_index: u32,
+}
+
+
+impl<M: MemPool> AppendOnlyStoreRangeIter<M> {
+    pub fn new(store: Arc<AppendOnlyStore<M>>, start: u32, end: u32) -> Self {
+        Self {
+            store,
+            start_index: start,
+            end_index: end,
+            current_index: start,
+        }
+    }
+}
+
+impl<T: MemPool> Iterator for AppendOnlyStoreRangeIter<T> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_index >= self.end_index {
+            return None;
+        }
+
+        // Fetch the key-value pair at the current index
+        let result = self.store.get_slot_at(self.current_index);
+
+        self.current_index += 1;
+
+        result
     }
 }
 
