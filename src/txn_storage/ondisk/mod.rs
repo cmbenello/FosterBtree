@@ -1,8 +1,8 @@
 use std::{
-    cell::UnsafeCell,
-    collections::HashSet,
-    sync::{Arc, Mutex, RwLock},
+    cell::UnsafeCell, collections::HashSet, mem::uninitialized, sync::{Arc, Mutex, RwLock}
 };
+
+use crate::access_method::AccessMethodError;
 
 use super::{
     ContainerOptions, ContainerType, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
@@ -160,6 +160,23 @@ impl<M: MemPool> OnDiskIterator<M> {
             }
             OnDiskIterator::BTree(iter) => iter.lock().unwrap().next(),
             OnDiskIterator::Vec(iter) => iter.lock().unwrap().next(),
+        }
+    }
+
+    /// Seeks the iterator to the specified index.
+    fn seek(&self, index: usize) -> Result<(), AccessMethodError> {
+        match self {
+            OnDiskIterator::Hash() => {
+                unimplemented!("Hash container not implemented")
+            }
+            OnDiskIterator::BTree(_) => {
+                // BTree seek not implemented
+                unimplemented!()
+            }
+            OnDiskIterator::Vec(iter_mutex) => {
+                let mut iter = iter_mutex.lock().unwrap();
+                iter.seek_to_index(index)
+            }
         }
     }
 }
@@ -505,5 +522,49 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn drop_iterator_handle(&self, _iter: Self::IteratorHandle) -> Result<(), TxnStorageStatus> {
         // Do nothing
         Ok(())
+    }
+
+    /// Initiates a scan starting from `start_index` up to `end_index`.
+    fn scan_range_from(
+        &self,
+        _txn: &Self::TxnHandle,
+        c_id: &ContainerId,
+        start_index: usize,
+        end_index: usize,
+        _options: ScanOptions,
+    ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
+        let containers = unsafe { &*self.containers.get() };
+        let storage = containers[*c_id as usize].as_ref();
+        match storage {
+            Storage::AppendOnly(append_only) => {
+                // Initialize the scanner starting from `start_index` to `end_index`
+                let scanner = append_only.scan_range_from(start_index, end_index)
+                    .map_err(|e| TxnStorageStatus::AccessError(e))?;
+                Ok(OnDiskIterator::Vec(Mutex::new(scanner)))
+            }
+            Storage::BTreeMap(_) | Storage::HashMap() => {
+                unimplemented!()
+            }
+        }
+    }
+
+    /// Seeks the iterator to the specified `start_index`.
+    fn seek(
+        &self,
+        _txn: &Self::TxnHandle,
+        c_id: &ContainerId,
+        iter: &Self::IteratorHandle,
+        start_index: usize,
+    ) -> Result<(), TxnStorageStatus> {
+        match iter {
+            OnDiskIterator::Vec(scanner_mutex) => {
+                let mut scanner = scanner_mutex.lock().unwrap();
+                scanner.seek_to_index(start_index)
+                    .map_err(|e| TxnStorageStatus::AccessError(e))
+            }
+            OnDiskIterator::BTree(_) | OnDiskIterator::Hash() => {
+                unimplemented!()
+            }
+        }
     }
 }

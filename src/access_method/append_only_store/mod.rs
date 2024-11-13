@@ -78,7 +78,7 @@ pub struct AppendOnlyStore<T: MemPool> {
     pub mem_pool: Arc<T>,
     stats: RuntimeStats, // Stats are not durable
 
-    // Tracking page indexes useful for reading ahead
+    // Tracking page indexes useful for reading ahead xtx do i need to keep track of frames?
     pages: RwLock<Vec<(PageId, u32, u32)>>, // (page_id, frame_id, slot_count)
 
 }
@@ -259,6 +259,7 @@ impl<T: MemPool> AppendOnlyStore<T> {
             // Add the new page to the pages index
             let mut pages = self.pages.write().unwrap();
             pages.push((page_id, frame_id, new_page.slot_count()));
+            // println!("added a new page");
 
             Ok(())
         }
@@ -266,39 +267,72 @@ impl<T: MemPool> AppendOnlyStore<T> {
 
     pub fn scan(self: &Arc<Self>) -> AppendOnlyStoreScanner<T> {
         AppendOnlyStoreScanner {
-            storage: self.clone(),
-            initialized: false,
             finished: false,
+            initialized: false,
+            storage: self.clone(),
             current_page: None,
             current_slot_id: 0,
+            current_page_idx: 0,
+            total_index: 0,
+            end_index: 0, //xtx
         }
     }
 
-    pub fn get_slot_at(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Finds the page index and slot within the page for the given record index using binary search.
+    fn find_page_and_slot(&self, index: usize) -> Option<(usize, usize)> {
         let pages = self.pages.read().unwrap();
-        let mut remaining = index;
+        let mut low = 0;
+        let mut high = pages.len();
+        let mut cumulative = 0;
 
-        //xtx update for binary search maybe?
-        for &(page_id, frame_id, slot_count) in pages.iter() {
-            if remaining < slot_count as usize{
-                // Found the target page and slot
-                let page_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
-                let page = self.read_page(page_key);
-                let (key, value) = page.get(remaining as u32);
-                return Some((key.to_vec(), value.to_vec()));
+        while low < high {
+            let mid = (low + high) / 2;
+            let page_slot_count = pages[mid].2 as usize;
+
+            if index < cumulative + page_slot_count {
+                high = mid;
             } else {
-                remaining -= slot_count as usize;
+                cumulative += page_slot_count;
+                low = mid + 1;
             }
         }
 
-        // Index out of bounds
-        None
+        if low < pages.len() {
+            let slot_id = index - cumulative;
+            Some((low, slot_id))
+        } else {
+            None
+        }
+    }
+
+    /// Retrieves the slot at a specific index using binary search.
+    pub fn get_slot_at(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+        match self.find_page_and_slot(index) {
+            Some((page_idx, slot_id)) => {
+                let pages = self.pages.read().unwrap();
+                let (page_id, frame_id, _) = pages[page_idx];
+                let page_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
+                let page = self.read_page(page_key);
+                let (key, value) = page.get(slot_id as u32);
+                Some((key.to_vec(), value.to_vec()))
+            }
+            None => None, // Index out of bounds
+        }
     }
 
     /// Creates a RangeScan iterator for the specified range
     pub fn range_scan(&self, start: usize, end: usize) -> AppendOnlyStoreRangeIter<T> {
         AppendOnlyStoreRangeIter::new(Arc::new(self.clone()), start, end)
     }
+
+        /// Initiates a scan starting from `start_index` up to `end_index`.
+        pub fn scan_range_from(
+            &self,
+            start_index: usize,
+            end_index: usize,
+        ) -> Result<AppendOnlyStoreScanner<T>, AccessMethodError> {
+            AppendOnlyStoreScanner::new(Arc::new(self.clone()), start_index, end_index)
+        }
 
     // XTX num_tuples
 
@@ -318,15 +352,43 @@ impl<T: MemPool> Clone for AppendOnlyStore<T> {
 }
 
 pub struct AppendOnlyStoreScanner<T: MemPool> {
-    storage: Arc<AppendOnlyStore<T>>,
-
-    initialized: bool,
     finished: bool,
-    current_page: Option<FrameReadGuard<'static>>,
+    initialized: bool,
+    storage: Arc<AppendOnlyStore<T>>,
+    current_page_idx: usize,
     current_slot_id: u32,
+    current_page: Option<FrameReadGuard<'static>>,
+    total_index: usize,
+    end_index: usize,
 }
 
 impl<T: MemPool> AppendOnlyStoreScanner<T> {
+    pub fn new(
+        storage: Arc<AppendOnlyStore<T>>,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<Self, AccessMethodError> {
+        if start_index > end_index || end_index > storage.num_kvs() {
+            return Err(AccessMethodError::Other("index out of bounds".to_string()));
+        }
+
+        // Find the starting page and slot using binary search
+        let (page_idx, slot_id) = storage
+            .find_page_and_slot(start_index)
+            .ok_or(AccessMethodError::Other("no slot".to_string()))?;
+
+        Ok(AppendOnlyStoreScanner {
+            finished: false,
+            initialized: false,
+            storage,
+            current_page_idx: page_idx,
+            current_slot_id: slot_id as u32,
+            current_page: None,
+            total_index: start_index,
+            end_index,
+        })
+    }
+
     fn initialize(&mut self) {
         let root_key = self.storage.root_key;
         let root_page = self.storage.read_page(root_key);
@@ -348,6 +410,65 @@ impl<T: MemPool> AppendOnlyStoreScanner<T> {
             }
         }
     }
+
+    /// Seeks the scanner to the specified index.
+    pub fn seek_to_index(&mut self, index: usize) -> Result<(), AccessMethodError> {
+        if index > self.end_index {
+            return Err(AccessMethodError::Other("index out of bounds".to_string()));
+        }
+
+        let (page_idx, slot_id) = self
+            .storage
+            .find_page_and_slot(index)
+            .ok_or(AccessMethodError::Other("index out of bounds".to_string()))?;
+
+        self.current_page_idx = page_idx;
+        self.current_slot_id = slot_id as u32;
+        self.current_page = None; // Reset the current page; it will be loaded in next()
+        self.total_index = index;
+
+        Ok(())
+    }
+
+    /// Retrieves the next key-value pair efficiently without re-searching.
+    pub fn next_record(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.total_index >= self.end_index {
+            return None;
+        }
+
+        // Load the current page if not already loaded
+        if self.current_page.is_none() {
+            let pages = self.storage.pages.read().unwrap();
+
+            if self.current_page_idx >= pages.len() {
+                return None; // Reached the end of pages
+            }
+
+            let (page_id, frame_id, _) = pages[self.current_page_idx];
+            let page_key = PageFrameKey::new_with_frame_id(self.storage.c_key, page_id, frame_id);
+            self.current_page = Some(self.storage.read_page(page_key));
+        }
+
+        let current_page = self.current_page.as_ref().unwrap();
+
+        // Fetch the slot count for boundary checks
+        let slot_count = current_page.slot_count();
+
+        if self.current_slot_id < slot_count {
+            // Retrieve the key-value pair
+            let (key, value) = current_page.get(self.current_slot_id);
+            self.current_slot_id += 1;
+            self.total_index += 1;
+            Some((key.to_vec(), value.to_vec()))
+        } else {
+            // Move to the next page
+            self.current_page_idx += 1;
+            self.current_slot_id = 0;
+            self.current_page = None; // Will load the next page in the next call
+            self.next_record()
+        }
+    }
+        
 }
 
 impl<T: MemPool> Iterator for AppendOnlyStoreScanner<T> {

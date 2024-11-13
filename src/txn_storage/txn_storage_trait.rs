@@ -265,4 +265,25 @@ pub trait TxnStorageTrait: Send + Sync {
 
     // Drop an iterator handle.
     fn drop_iterator_handle(&self, iter: Self::IteratorHandle) -> Result<(), TxnStorageStatus>;
+
+    // New methods for key-based jumping
+    /// Initiates a scan starting from `start_key` up to `end_key`.
+    /// If `end_key` is `None`, the scan goes until the end.
+    fn scan_range_from(
+        &self,
+        txn: &Self::TxnHandle,
+        c_id: &ContainerId,
+        start_index: usize,
+        end_index: usize,
+        options: ScanOptions,
+    ) -> Result<Self::IteratorHandle, TxnStorageStatus>;
+
+    /// Seeks the iterator to the specified key.
+    fn seek(
+        &self,
+        txn: &Self::TxnHandle,
+        c_id: &ContainerId,
+        iter: &Self::IteratorHandle,
+        start_index: usize,
+    ) -> Result<(), TxnStorageStatus>;
 }

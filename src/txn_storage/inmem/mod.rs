@@ -620,4 +620,27 @@ impl TxnStorageTrait for InMemStorage {
         // Do nothing
         Ok(())
     }
+
+        // Implement scan_range_from
+        fn scan_range_from(
+            &self,
+            _txn: &Self::TxnHandle,
+            _c_id: &ContainerId,
+            _start_index: usize,
+            _end_index: usize,
+            _options: ScanOptions,
+        ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
+            unimplemented!()
+        }
+    
+        // Implement seek
+        fn seek(
+            &self,
+            _txn: &Self::TxnHandle,
+            _c_id: &ContainerId,
+            _iter: &Self::IteratorHandle,
+            _start_index: usize,
+        ) -> Result<(), TxnStorageStatus> {
+            unimplemented!()
+        }
 }
