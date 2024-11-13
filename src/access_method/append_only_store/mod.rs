@@ -1,4 +1,5 @@
 mod append_only_page;
+use std::sync::atomic::Ordering;
 
 use append_only_page::AppendOnlyPage;
 use std::{
@@ -50,6 +51,15 @@ impl RuntimeStats {
     }
 }
 
+impl Clone for RuntimeStats {
+    fn clone(&self) -> Self {
+        RuntimeStats {
+            num_recs: AtomicUsize::new(self.num_recs.load(Ordering::Relaxed)),
+            num_pages: AtomicUsize::new(self.num_pages.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 /// In the append-only store, the pages forms a one-way linked list which we call a chain.
 /// The first page is called the root page.
 /// The append operation always appends data to the last page of the chain.
@@ -60,6 +70,7 @@ impl RuntimeStats {
 ///      |                                                        |
 ///      ----------------------------------------------------------
 ///
+
 pub struct AppendOnlyStore<T: MemPool> {
     pub c_key: ContainerKey,
     pub root_key: PageFrameKey,        // Fixed.
@@ -263,20 +274,20 @@ impl<T: MemPool> AppendOnlyStore<T> {
         }
     }
 
-    pub fn get_slot_at(&self, index: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+    pub fn get_slot_at(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
         let pages = self.pages.read().unwrap();
         let mut remaining = index;
 
         //xtx update for binary search maybe?
         for &(page_id, frame_id, slot_count) in pages.iter() {
-            if remaining < slot_count {
+            if remaining < slot_count as usize{
                 // Found the target page and slot
                 let page_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
                 let page = self.read_page(page_key);
                 let (key, value) = page.get(remaining as u32);
                 return Some((key.to_vec(), value.to_vec()));
             } else {
-                remaining -= slot_count;
+                remaining -= slot_count as usize;
             }
         }
 
@@ -284,6 +295,26 @@ impl<T: MemPool> AppendOnlyStore<T> {
         None
     }
 
+    /// Creates a RangeScan iterator for the specified range
+    pub fn range_scan(&self, start: usize, end: usize) -> AppendOnlyStoreRangeIter<T> {
+        AppendOnlyStoreRangeIter::new(Arc::new(self.clone()), start, end)
+    }
+
+    // XTX num_tuples
+
+}
+
+impl<T: MemPool> Clone for AppendOnlyStore<T> {
+    fn clone(&self) -> Self {
+        AppendOnlyStore {
+            c_key: self.c_key.clone(),
+            root_key: self.root_key.clone(),
+            last_key: Mutex::new(self.last_key.lock().unwrap().clone()),
+            mem_pool: self.mem_pool.clone(),
+            stats: self.stats.clone(),
+            pages: RwLock::new(self.pages.read().unwrap().clone()),
+        }
+    }
 }
 
 pub struct AppendOnlyStoreScanner<T: MemPool> {
@@ -385,14 +416,15 @@ impl<T: MemPool> Iterator for AppendOnlyStoreScanner<T> {
 
 pub struct AppendOnlyStoreRangeIter<M: MemPool> {
     store: Arc<AppendOnlyStore<M>>,
-    start_index: u32,
-    end_index: u32,
-    current_index: u32,
+    start_index: usize,
+    end_index: usize,
+    current_index: usize,
 }
+// XTX should i use usize or u32
 
 
 impl<M: MemPool> AppendOnlyStoreRangeIter<M> {
-    pub fn new(store: Arc<AppendOnlyStore<M>>, start: u32, end: u32) -> Self {
+    pub fn new(store: Arc<AppendOnlyStore<M>>, start: usize, end: usize) -> Self {
         Self {
             store,
             start_index: start,
