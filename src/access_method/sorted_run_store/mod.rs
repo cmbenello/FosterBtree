@@ -31,6 +31,13 @@ use crate::prelude::{PageId, ContainerKey};
 use crate::page::Page;
 use crate::prelude::FrameReadGuard;
 
+
+pub struct BigSortedRunStore<T: MemPool>{
+    sorted_run_stores: Vec<SortedRunStore<T>>,
+}
+
+impl<T: MemPool> BigSortedRunStore<T> {
+}
 /// `SortedRunStore` manages a collection of sorted pages (runs) for external sorting.
 ///
 /// It allows for storing sorted key-value pairs across multiple pages and provides
@@ -38,7 +45,8 @@ use crate::prelude::FrameReadGuard;
 pub struct SortedRunStore<T: MemPool> {
     c_key: ContainerKey,      // Container key identifying the storage container
     mem_pool: Arc<T>,         // Shared memory pool for page management
-    page_ids: Vec<PageId>,    // List of page IDs that make up the sorted run
+    page_ids: Vec<PageId>,    // List of page IDs that make up the sorted run xtx replace with num tuples in each page
+    total_len: usize,    // List of page IDs that make up the sorted run xtx replace with num tuples in each page
     min_keys: Vec<Vec<u8>>,   // Stores the minimum key of each page for efficient lookup
 }
 
@@ -66,6 +74,7 @@ impl<T: MemPool> SortedRunStore<T> {
         current_page.init();              // Initialize the page
         let mut first_key_in_page = None; // Keep track of the first key in the current page
 
+        let mut len = 0;
         // Iterate over key-value pairs
         for (key, value) in iter {
             // Attempt to append the key-value pair to the current page
@@ -87,6 +96,7 @@ impl<T: MemPool> SortedRunStore<T> {
                 assert!(current_page.append(key.as_ref(), value.as_ref()));
                 first_key_in_page = Some(key.as_ref().to_vec());
             }
+            len += 1;
         }
         // Finish the last page if there are any remaining keys
         if let Some(first_key) = first_key_in_page {
@@ -100,6 +110,7 @@ impl<T: MemPool> SortedRunStore<T> {
             c_key,
             mem_pool,
             page_ids,
+            total_len : len,
             min_keys,
         }
     }
@@ -131,22 +142,49 @@ impl<T: MemPool> SortedRunStore<T> {
             0
         } else {
             // Binary search over min_keys to find the starting page index
+            // We need to find the last page whose min_key is < lower_bound
             let mut left = 0;
             let mut right = self.min_keys.len();
-            // XTX the line below should be left < right but for some reason it thinks that upper and lower are reversed
-            while left > right {
-                let mid = (left + right) / 2;
-                if self.min_keys[mid].as_slice() < lower_bound {
-                    left = mid + 1;
-                } else {
-                    right = mid;
+    
+            while left < right {
+                let mid = left + (right - left) / 2;
+                
+                match self.min_keys[mid].as_slice().cmp(lower_bound) {
+                    std::cmp::Ordering::Less => {
+                        // The minimum key is less than our lower bound
+                        // This page might contain our values, try to find a later page
+                        left = mid + 1;
+                    },
+                    std::cmp::Ordering::Equal => {
+                        // If we find an exact match, we want this page
+                        // but also need to check previous pages for potential matches
+                        right = mid;
+                    },
+                    std::cmp::Ordering::Greater => {
+                        // The minimum key is greater than our lower bound
+                        // Need to look in earlier pages
+                        right = mid;
+                    }
                 }
             }
-            left
+    
+            // If left == min_keys.len(), we want the last page
+            // Otherwise, we want the page before left (unless left is 0)
+            if left == self.min_keys.len() {
+                self.min_keys.len() - 1
+            } else if left > 0 {
+                // If the page at left-1 has min_key equal to lower_bound,
+                // we might need to go back one more page
+                if left > 1 && self.min_keys[left-1].as_slice() == lower_bound {
+                    left - 2
+                } else {
+                    left - 1
+                }
+            } else {
+                0
+            }
         };
-
-
-        // Create and return the range scanner
+    
         SortedRunStoreRangeScanner {
             storage: self,
             lower_bound: lower_bound.to_vec(),
@@ -162,22 +200,7 @@ impl<T: MemPool> SortedRunStore<T> {
     /// This method iterates over all the pages in the run and sums up the number of
     /// tuples in each page. It provides an aggregate count of all key-value pairs stored.
     pub fn len(&self) -> usize {
-        let mut total_tuples = 0;
-        for &page_id in &self.page_ids {
-            let page_key = PageFrameKey::new(self.c_key, page_id);
-            // Attempt to get the page for reading
-            if let Ok(page) = self.mem_pool.get_page_for_read(page_key) {
-                // Add the number of slots (tuples) in the page to the total count
-                total_tuples += page.slot_count() as usize;
-                // Optionally, drop the page to release the read lock
-                drop(page);
-            } else {
-                // Handle the case where the page cannot be read
-                // For debugging, you might want to log a warning or return an error
-                eprintln!("Warning: Unable to read page with ID {:?}", page_id);
-            }
-        }
-        total_tuples
+        self.total_len
     }
 
     /// Returns the total number of pages used in the `SortedRunStore`.
@@ -199,7 +222,7 @@ pub struct SortedRunStoreRangeScanner<'a, T: MemPool> {
     storage: &'a SortedRunStore<T>,            // Reference to the storage
     lower_bound: Vec<u8>,                      // Inclusive lower bound for keys
     upper_bound: Vec<u8>,                      // Exclusive upper bound for keys
-    current_page_index: usize,                 // Index of the current page in `page_ids`
+    pub current_page_index: usize,                 // Index of the current page in `page_ids`
     current_page: Option<FrameReadGuard<'static>>, // Current page being scanned
     current_slot_id: u32,                      // Current position within the page
 }
