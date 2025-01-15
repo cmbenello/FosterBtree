@@ -31,13 +31,7 @@ use crate::prelude::{PageId, ContainerKey};
 use crate::page::Page;
 use crate::prelude::FrameReadGuard;
 
-
-pub struct BigSortedRunStore<T: MemPool>{
-    sorted_run_stores: Vec<SortedRunStore<T>>,
-}
-
-impl<T: MemPool> BigSortedRunStore<T> {
-}
+#[derive(Debug)]
 /// `SortedRunStore` manages a collection of sorted pages (runs) for external sorting.
 ///
 /// It allows for storing sorted key-value pairs across multiple pages and provides
@@ -118,7 +112,7 @@ impl<T: MemPool> SortedRunStore<T> {
     /// Creates an iterator over all key-value pairs in the sorted run.
     ///
     /// This is equivalent to calling `scan_range` with empty bounds.
-    pub fn scan<'a>(&'a self) -> SortedRunStoreRangeScanner<'a, T> {
+    pub fn scan<'a>(&'a self) -> SortedRunStoreRangeScanner<T> {
         self.scan_range(&[], &[])
     }
 
@@ -136,7 +130,7 @@ impl<T: MemPool> SortedRunStore<T> {
         &'a self,
         lower_bound: &[u8],
         upper_bound: &[u8],
-    ) -> SortedRunStoreRangeScanner<'a, T> {
+    ) -> SortedRunStoreRangeScanner<T> {
         // Determine the starting page index based on the lower bound
         let start_page_index = if lower_bound.is_empty() {
             0
@@ -186,7 +180,7 @@ impl<T: MemPool> SortedRunStore<T> {
         };
     
         SortedRunStoreRangeScanner {
-            storage: self,
+            storage: Arc::new(self.clone()),
             lower_bound: lower_bound.to_vec(),
             upper_bound: upper_bound.to_vec(),
             current_page_index: start_page_index,
@@ -217,9 +211,21 @@ impl<T: MemPool> SortedRunStore<T> {
     }
 }
 
+impl<T: MemPool> Clone for SortedRunStore<T> {
+    fn clone(&self) -> Self {
+        SortedRunStore {
+            c_key: self.c_key,
+            mem_pool: self.mem_pool.clone(),
+            page_ids: self.page_ids.clone(),
+            total_len: self.total_len,
+            min_keys: self.min_keys.clone(),
+        }
+    }
+}
+
 /// Iterator for scanning over a range of key-value pairs in a `SortedRunStore`.
-pub struct SortedRunStoreRangeScanner<'a, T: MemPool> {
-    storage: &'a SortedRunStore<T>,            // Reference to the storage
+pub struct SortedRunStoreRangeScanner<T: MemPool> {
+    storage: Arc<SortedRunStore<T>>,            // Reference to the storage
     lower_bound: Vec<u8>,                      // Inclusive lower bound for keys
     upper_bound: Vec<u8>,                      // Exclusive upper bound for keys
     pub current_page_index: usize,                 // Index of the current page in `page_ids`
@@ -227,7 +233,7 @@ pub struct SortedRunStoreRangeScanner<'a, T: MemPool> {
     current_slot_id: u32,                      // Current position within the page
 }
 
-impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<'a, T> {
+impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<T> {
     type Item = (Vec<u8>, Vec<u8>); // Returns key-value pairs as (Vec<u8>, Vec<u8>)
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -269,5 +275,199 @@ impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<'a, T> {
             self.current_page = None;
             self.current_page_index += 1;
         }
+    }
+}
+
+/// A collection of multiple `SortedRunStore`s that can be iterated over as a single sorted sequence.
+///
+/// `BigSortedRunStore` maintains multiple `SortedRunStore`s and provides methods to iterate over them
+/// as if they were a single sorted collection. While individual `SortedRunStore`s are internally sorted,
+/// there is no guaranteed ordering between different stores. The iterator handles this by always
+/// returning the smallest available key across all stores.
+pub struct BigSortedRunStore<T: MemPool> {
+    sorted_run_stores: Vec<SortedRunStore<T>>,
+}
+
+impl<T: MemPool> BigSortedRunStore<T> {
+    /// Creates a new empty `BigSortedRunStore`.
+    ///
+    /// Returns a `BigSortedRunStore` with no underlying stores. Stores can be added later using
+    /// the `add_store` method.
+    ///
+    /// # Examples
+    /// ```
+    /// let big_store: BigSortedRunStore<MyMemPool> = BigSortedRunStore::new();
+    /// ```
+    pub fn new() -> Self {
+        Self {
+            sorted_run_stores: Vec::new(),
+        }
+    }
+
+    /// Adds a `SortedRunStore` to the collection.
+    ///
+    /// The added store becomes part of the collection and will be included in all subsequent
+    /// scans and iterations. Note that there is no guaranteed ordering between different stores -
+    /// the iterator will handle sorting across stores during iteration.
+    ///
+    /// # Arguments
+    /// * `store` - The `SortedRunStore` to add to the collection
+    ///
+    /// # Examples
+    /// ```
+    /// let mut big_store = BigSortedRunStore::new();
+    /// let store = SortedRunStore::new(/* params */);
+    /// big_store.add_store(store);
+    /// ```
+    pub fn add_store(&mut self, store: SortedRunStore<T>) {
+        self.sorted_run_stores.push(store);
+    }
+
+    /// Returns the total number of key-value pairs across all stores.
+    ///
+    /// This method sums up the lengths of all contained `SortedRunStore`s to provide
+    /// the total count of key-value pairs in the collection.
+    ///
+    /// # Returns
+    /// * The total number of key-value pairs in all stores combined
+    ///
+    /// # Examples
+    /// ```
+    /// let big_store = BigSortedRunStore::new();
+    /// let total_pairs = big_store.len();
+    /// println!("Total key-value pairs: {}", total_pairs);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.sorted_run_stores.iter().map(|store| store.len()).sum()
+    }
+
+    /// Returns the total number of pages used across all stores.
+    ///
+    /// This method sums up the number of pages in all contained `SortedRunStore`s to
+    /// provide the total page count for the collection.
+    ///
+    /// # Returns
+    /// * The total number of pages used by all stores combined
+    ///
+    /// # Examples
+    /// ```
+    /// let big_store = BigSortedRunStore::new();
+    /// let total_pages = big_store.num_pages();
+    /// println!("Total pages used: {}", total_pages);
+    /// ```
+    pub fn num_pages(&self) -> usize {
+        self.sorted_run_stores.iter().map(|store| store.num_pages()).sum()
+    }
+
+    /// Creates an iterator over all key-value pairs in all stores.
+    ///
+    /// This method provides an iterator that will return all key-value pairs across
+    /// all stores in sorted order by key. This is equivalent to calling `scan_range`
+    /// with empty bounds.
+    ///
+    /// # Returns
+    /// * A `BigSortedRunStoreScanner` that iterates over all key-value pairs
+    ///
+    /// # Examples
+    /// ```
+    /// let big_store = BigSortedRunStore::new();
+    /// for (key, value) in big_store.scan() {
+    ///     println!("Key: {:?}, Value: {:?}", key, value);
+    /// }
+    /// ```
+    pub fn scan(&self) -> BigSortedRunStoreScanner<T> {
+        self.scan_range(&[], &[])
+    }
+
+    /// Creates an iterator over a range of key-value pairs across all stores.
+    ///
+    /// This method provides an iterator that will return key-value pairs within the
+    /// specified range across all stores in sorted order by key. The range is inclusive
+    /// of the lower bound and exclusive of the upper bound.
+    ///
+    /// # Arguments
+    /// * `lower_bound` - The inclusive lower bound of keys to return (empty slice for no lower bound)
+    /// * `upper_bound` - The exclusive upper bound of keys to return (empty slice for no upper bound)
+    ///
+    /// # Returns
+    /// * A `BigSortedRunStoreScanner` that iterates over key-value pairs within the specified range
+    ///
+    /// # Examples
+    /// ```
+    /// let big_store = BigSortedRunStore::new();
+    /// let lower = b"start";
+    /// let upper = b"end";
+    /// for (key, value) in big_store.scan_range(lower, upper) {
+    ///     println!("Key: {:?}, Value: {:?}", key, value);
+    /// }
+    /// ```
+    pub fn scan_range(&self, lower_bound: &[u8], upper_bound: &[u8]) -> BigSortedRunStoreScanner<T> {
+        let scanners: Vec<_> = self.sorted_run_stores
+            .iter()
+            .map(|store| store.scan_range(lower_bound, upper_bound))
+            .collect();
+
+        BigSortedRunStoreScanner {
+            scanners,
+            current_values: vec![None; self.sorted_run_stores.len()],
+        }
+    }
+}
+
+/// Iterator for scanning over key-value pairs across multiple `SortedRunStore`s.
+///
+/// This scanner maintains a buffer of the current value from each underlying store
+/// and always returns the key-value pair with the smallest key. This ensures that
+/// even though the underlying stores might not be sorted relative to each other,
+/// the iterator provides values in sorted order.
+pub struct BigSortedRunStoreScanner<T: MemPool> {
+    scanners: Vec<SortedRunStoreRangeScanner<T>>,
+    current_values: Vec<Option<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl<'a, T: MemPool> Iterator for BigSortedRunStoreScanner<T> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    /// Returns the next key-value pair in sorted order across all stores.
+    ///
+    /// This method maintains a buffer of the current value from each store and
+    /// always returns the pair with the smallest key. When a value is returned,
+    /// that store's buffer is refilled with its next value.
+    ///
+    /// # Returns
+    /// * `Some((key, value))` if there are more pairs to return
+    /// * `None` if iteration is complete
+    fn next(&mut self) -> Option<Self::Item> {
+        // Fill any empty slots in current_values with the next value from corresponding scanner
+        for (i, scanner) in self.scanners.iter_mut().enumerate() {
+            if self.current_values[i].is_none() {
+                self.current_values[i] = scanner.next();
+            }
+        }
+
+        // Find the minimum key among current values
+        let mut min_idx = None;
+        let mut min_key = None;
+
+        for (i, value) in self.current_values.iter().enumerate() {
+            if let Some((key, _)) = value {
+                match min_key {
+                    None => {
+                        min_idx = Some(i);
+                        min_key = Some(key);
+                    }
+                    Some(current_min) if key < current_min => {
+                        min_idx = Some(i);
+                        min_key = Some(key);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Return and clear the minimum value if found
+        min_idx.map(|i| {
+            self.current_values[i].take().unwrap()
+        })
     }
 }
