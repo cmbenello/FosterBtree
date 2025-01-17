@@ -285,7 +285,7 @@ impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<T> {
 /// there is no guaranteed ordering between different stores. The iterator handles this by always
 /// returning the smallest available key across all stores.
 pub struct BigSortedRunStore<T: MemPool> {
-    sorted_run_stores: Vec<SortedRunStore<T>>,
+    sorted_run_stores: Vec<Arc<SortedRunStore<T>>>,
 }
 
 impl<T: MemPool> BigSortedRunStore<T> {
@@ -319,7 +319,7 @@ impl<T: MemPool> BigSortedRunStore<T> {
     /// let store = SortedRunStore::new(/* params */);
     /// big_store.add_store(store);
     /// ```
-    pub fn add_store(&mut self, store: SortedRunStore<T>) {
+    pub fn add_store(&mut self, store: Arc<SortedRunStore<T>>) {
         self.sorted_run_stores.push(store);
     }
 
