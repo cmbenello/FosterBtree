@@ -1,4 +1,6 @@
 use std::io;
+use crate::log_trace;
+
 
 #[derive(Debug, PartialEq)]
 pub enum FMError {
@@ -222,19 +224,19 @@ pub mod async_write {
         }
 
         pub fn read_page(&self, page_id: PageId, page: &mut Page) -> Result<(), FMError> {
-            log_trace!("Reading page: {} from file: {:?}", page_id, self.path);
+            //log_trace!("Reading page: {} from file: {:?}", page_id, self.path);
             let mut file_inner = self.file_inner.lock().unwrap();
             file_inner.read_page(page_id, page)
         }
 
         pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<(), FMError> {
-            log_trace!("Writing page: {} to file: {:?}", page_id, self.path);
+            //log_trace!("Writing page: {} to file: {:?}", page_id, self.path);
             let mut file_inner = self.file_inner.lock().unwrap();
             file_inner.write_page(page_id, page)
         }
 
         pub fn flush(&self) -> Result<(), FMError> {
-            log_trace!("Flushing file: {:?}", self.path);
+            //log_trace!("Flushing file: {:?}", self.path);
             let mut file_inner = self.file_inner.lock().unwrap();
             file_inner.flush_page()
         }
