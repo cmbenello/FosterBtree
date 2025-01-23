@@ -286,6 +286,7 @@ impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<T> {
 /// returning the smallest available key across all stores.
 pub struct BigSortedRunStore<T: MemPool> {
     sorted_run_stores: Vec<Arc<SortedRunStore<T>>>,
+    first_keys: Vec<Vec<u8>>,
 }
 
 impl<T: MemPool> BigSortedRunStore<T> {
@@ -301,6 +302,7 @@ impl<T: MemPool> BigSortedRunStore<T> {
     pub fn new() -> Self {
         Self {
             sorted_run_stores: Vec::new(),
+            first_keys: Vec::new(),
         }
     }
 
@@ -320,6 +322,7 @@ impl<T: MemPool> BigSortedRunStore<T> {
     /// big_store.add_store(store);
     /// ```
     pub fn add_store(&mut self, store: Arc<SortedRunStore<T>>) {
+        self.first_keys.push(store.min_keys[0].clone());
         self.sorted_run_stores.push(store);
     }
 
@@ -402,17 +405,51 @@ impl<T: MemPool> BigSortedRunStore<T> {
     /// }
     /// ```
     pub fn scan_range(&self, lower_bound: &[u8], upper_bound: &[u8]) -> BigSortedRunStoreScanner<T> {
-        let scanners: Vec<_> = self.sorted_run_stores
+        let mut start_idx = if lower_bound.is_empty() {
+            0
+        } else {
+            // Binary search for lower bound
+            let mut left = 0;
+            let mut right = self.first_keys.len();
+    
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match self.first_keys[mid].as_slice().cmp(lower_bound) {
+                    std::cmp::Ordering::Less => left = mid + 1,
+                    std::cmp::Ordering::Equal => right = mid,
+                    std::cmp::Ordering::Greater => right = mid,
+                }
+            }
+            if left > 0 { left - 1 } else { 0 }
+        };
+    
+        let end_idx = if upper_bound.is_empty() {
+            self.first_keys.len()
+        } else {
+            // Binary search for upper bound
+            let mut left = start_idx;
+            let mut right = self.first_keys.len();
+    
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match self.first_keys[mid].as_slice().cmp(upper_bound) {
+                    std::cmp::Ordering::Less => left = mid + 1,
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => right = mid,
+                }
+            }
+            left
+        };
+    
+        let scanners = self.sorted_run_stores[start_idx..end_idx]
             .iter()
             .map(|store| store.scan_range(lower_bound, upper_bound))
             .collect();
-
+    
         BigSortedRunStoreScanner {
             scanners,
-            current_values: vec![None; self.sorted_run_stores.len()],
+            current_values: vec![None; end_idx - start_idx],
         }
-    }
-}
+    }}
 
 /// Iterator for scanning over key-value pairs across multiple `SortedRunStore`s.
 ///
