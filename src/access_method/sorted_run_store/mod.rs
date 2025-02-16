@@ -325,8 +325,6 @@ impl<T: MemPool> BigSortedRunStore<T> {
         // If the sorted run is empty, then its min_keys will be empty.
         // In that case, simply do not add it.
         if store.min_keys.is_empty() {
-            // Optionally, log a warning:
-            eprintln!("Warning: Trying to add an empty SortedRunStore; skipping.");
             return;
         }
         self.first_keys.push(store.min_keys[0].clone());
