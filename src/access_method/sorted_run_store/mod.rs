@@ -238,40 +238,44 @@ impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // If there is no current page loaded
+            // If current_page is empty, move to the next page
             if self.current_page.is_none() {
-                // Check if we have reached the end of the pages
                 if self.current_page_index >= self.storage.page_ids.len() {
                     return None;
                 }
-                // Load the page
                 let page_id = self.storage.page_ids[self.current_page_index];
                 let page_key = PageFrameKey::new(self.storage.c_key, page_id);
                 let page = self.storage.mem_pool.get_page_for_read(page_key).ok()?;
-                // Extend the lifetime to 'static (unsafe operation)
                 self.current_page = Some(unsafe {
                     std::mem::transmute::<FrameReadGuard<'_>, FrameReadGuard<'static>>(page)
                 });
-                self.current_slot_id = 0; // Start from the first slot in the page
+                self.current_slot_id = 0;
             }
-            // Get a reference to the current page
+    
             let page = self.current_page.as_ref().unwrap();
-            // Iterate over the slots in the current page
             while self.current_slot_id < page.slot_count() {
                 let (key, value) = page.get(self.current_slot_id);
                 self.current_slot_id += 1;
-                // Check if the key is within the specified bounds
-                if key >= self.lower_bound.as_slice()
-                    && (self.upper_bound.is_empty() || key < self.upper_bound.as_slice())
-                {
-                    // Key is within bounds; return the key-value pair
-                    return Some((key.to_vec(), value.to_vec()));
-                } else if !self.upper_bound.is_empty() && key >= self.upper_bound.as_slice() {
-                    // Key has exceeded the upper bound; end iteration
-                    return None;
+    
+                // Lower bound: key must be >= lower_bound
+                if key < self.lower_bound.as_slice() {
+                    // keep searching
+                    continue;
                 }
+    
+                // **Upper bound: key must be < upper_bound** (always half-open)
+                if !self.upper_bound.is_empty() {
+                    if key >= self.upper_bound.as_slice() {
+                        // This key is outside our range, so we can stop this iteration
+                        return None;
+                    }
+                }
+    
+                // Key is within [lower_bound, upper_bound), so yield it
+                return Some((key.to_vec(), value.to_vec()));
             }
-            // Move to the next page
+    
+            // If we exhaust this page, move on to the next
             self.current_page = None;
             self.current_page_index += 1;
         }
