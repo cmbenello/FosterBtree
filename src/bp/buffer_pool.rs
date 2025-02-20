@@ -597,7 +597,10 @@ impl MemPool for BufferPool {
         let container_to_file = unsafe { &mut *self.container_to_file.get() };
 
         let fm = container_to_file.entry(c_key).or_insert_with(|| {
-            FileManager::new(self.path.join(c_key.db_id.to_string()), c_key.c_id).unwrap()
+            match(FileManager::new(self.path.join(c_key.db_id.to_string()), c_key.c_id)){
+                Ok(x) => x,
+                Err(y) => panic!("{:?}", y),
+            }
         });
 
         let page_id = fm.fetch_add_page_id();
