@@ -1,8 +1,12 @@
 mod gensort_page;
-use gensort_page::{GensortPage, RECORD_SIZE};
+use gensort_page::GensortPage;
 
 use std::sync::{Arc, Mutex};
 use crate::prelude::{ContainerKey, MemPool, PageFrameKey, Page, PageId, FrameReadGuard};
+
+pub const RECORD_KEY_SIZE: usize = 10; 
+pub const RECORD_VALUE_SIZE: usize = 90;  
+pub const RECORD_SIZE: usize = RECORD_KEY_SIZE + RECORD_VALUE_SIZE;
 
 pub struct GensortStore<T: MemPool> {
     pub c_key: ContainerKey,
@@ -323,7 +327,6 @@ impl<T: MemPool> Iterator for RangeScanner<T> {
 mod tests {
     use super::*;
     use crate::bp::{get_test_bp};
-    use gensort_page::{RECORD_KEY_SIZE, RECORD_VALUE_SIZE};
     use std::thread;
 
     fn get_c_key() -> ContainerKey {

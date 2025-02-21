@@ -80,6 +80,7 @@ pub enum ContainerType {
     Hash,
     BTree,
     AppendOnly,
+    Gensort,
 }
 
 impl ContainerType {
@@ -88,6 +89,7 @@ impl ContainerType {
             ContainerType::Hash => vec![0],
             ContainerType::BTree => vec![1],
             ContainerType::AppendOnly => vec![2],
+            ContainerType::Gensort => vec![3],
         }
     }
 
@@ -96,6 +98,7 @@ impl ContainerType {
             0 => ContainerType::Hash,
             1 => ContainerType::BTree,
             2 => ContainerType::AppendOnly,
+            3 => ContainerType::Gensort,
             _ => panic!("Invalid container type"),
         }
     }

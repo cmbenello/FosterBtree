@@ -1,9 +1,8 @@
 use crate::prelude::{Page, PageId, AVAILABLE_PAGE_SIZE};
+use crate::access_method::gensort_store::{RECORD_KEY_SIZE, RECORD_SIZE, RECORD_VALUE_SIZE};
 
 // Constants for the gensort format
-pub const RECORD_KEY_SIZE: usize = 10; 
-pub const RECORD_VALUE_SIZE: usize = 90;  
-pub const RECORD_SIZE: usize = RECORD_KEY_SIZE + RECORD_VALUE_SIZE;
+
 
 // Page header only needs minimal information
 pub const PAGE_HEADER_SIZE: usize = 8;  // next_page (4 bytes) + record_count (4 bytes)

@@ -2,7 +2,10 @@ use std::{
     cell::UnsafeCell, collections::HashSet, mem::uninitialized, sync::{Arc, Mutex, RwLock}
 };
 
-use crate::access_method::AccessMethodError;
+use crate::access_method::{
+    gensort_store::{
+        GensortStore, RECORD_KEY_SIZE, RECORD_VALUE_SIZE, RECORD_SIZE, GensortStoreScan, RangeScanner}, 
+        AccessMethodError};
 
 use super::{
     ContainerOptions, ContainerType, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
@@ -23,6 +26,7 @@ pub enum Storage<M: MemPool> {
     HashMap(),
     BTreeMap(Arc<FosterBtree<M>>),
     AppendOnly(Arc<AppendOnlyStore<M>>),
+    Gensort(Arc<GensortStore<M>>),
 }
 
 unsafe impl<M: MemPool> Sync for Storage<M> {}
@@ -38,6 +42,10 @@ impl<M: MemPool> Storage<M> {
                 bp,
             ))),
             ContainerType::AppendOnly => Storage::AppendOnly(Arc::new(AppendOnlyStore::<M>::new(
+                ContainerKey::new(db_id, c_id),
+                bp,
+            ))),
+            ContainerType::Gensort => Storage::Gensort(Arc::new(GensortStore::<M>::new(
                 ContainerKey::new(db_id, c_id),
                 bp,
             ))),
@@ -59,6 +67,7 @@ impl<M: MemPool> Storage<M> {
                 bp,
                 0,
             ))),
+            ContainerType::Gensort => todo!("xtx")
         }
     }
 
@@ -73,6 +82,19 @@ impl<M: MemPool> Storage<M> {
             }
             Storage::BTreeMap(b) => b.insert(&key, &val)?,
             Storage::AppendOnly(v) => v.append(&key, &val)?,
+            Storage::Gensort(g) => {
+                // For Gensort, we need to combine key and value into a single record
+                if key.len() != RECORD_KEY_SIZE || val.len() != RECORD_VALUE_SIZE {
+                    return Err(TxnStorageStatus::Error);
+                }
+                
+                // Combine key and value into a single record
+                let mut record = Vec::with_capacity(RECORD_SIZE);
+                record.extend_from_slice(&key);
+                record.extend_from_slice(&val);
+                
+                g.append(&record);
+            }
         };
         Ok(())
     }
@@ -85,6 +107,9 @@ impl<M: MemPool> Storage<M> {
             Storage::BTreeMap(b) => b.get(key)?,
             Storage::AppendOnly(v) => {
                 unimplemented!("get by key is not supported for append only container")
+            }
+            Storage::Gensort(_) => {
+                unimplemented!("get by key is not supported for gensort container")
             }
         };
         Ok(result)
@@ -99,6 +124,9 @@ impl<M: MemPool> Storage<M> {
             Storage::AppendOnly(v) => {
                 unimplemented!("update by key is not supported for append only container")
             }
+            Storage::Gensort(_) => {
+                unimplemented!("update by key is not supported for gensort container")
+            }
         };
         Ok(())
     }
@@ -112,6 +140,9 @@ impl<M: MemPool> Storage<M> {
             Storage::AppendOnly(v) => {
                 unimplemented!("remove by key is not supported for append only container")
             }
+            Storage::Gensort(_) => {
+                unimplemented!("remove by key is not supported for gensort container")
+            }
         };
         Ok(())
     }
@@ -123,6 +154,7 @@ impl<M: MemPool> Storage<M> {
             }
             Storage::BTreeMap(b) => OnDiskIterator::btree(b.scan()),
             Storage::AppendOnly(v) => OnDiskIterator::vec(v.scan()),
+            Storage::Gensort(g) => OnDiskIterator::gensort(g.scan()),
         }
     }
 
@@ -133,6 +165,7 @@ impl<M: MemPool> Storage<M> {
             }
             Storage::BTreeMap(b) => b.num_kvs(),
             Storage::AppendOnly(v) => v.num_kvs(),
+            Storage::Gensort(g) => g.get_num_records(),
         }
     }
 }
@@ -142,6 +175,8 @@ pub enum OnDiskIterator<M: MemPool> {
     Hash(),
     BTree(Mutex<FosterBtreeRangeScanner<M>>),
     Vec(Mutex<AppendOnlyStoreScanner<M>>),
+    Gensort(Mutex<GensortStoreScan<M>>),
+    GensortRange(Mutex<RangeScanner<M>>),
 }
 
 impl<M: MemPool> OnDiskIterator<M> {
@@ -153,6 +188,13 @@ impl<M: MemPool> OnDiskIterator<M> {
         OnDiskIterator::Vec(Mutex::new(iter))
     }
 
+    fn gensort(iter: GensortStoreScan<M>) -> Self {
+        OnDiskIterator::Gensort(Mutex::new(iter))
+    }
+    fn gensort_range(iter: RangeScanner<M>) -> Self {
+        OnDiskIterator::GensortRange(Mutex::new(iter))
+    }
+
     fn next(&self) -> Option<(Vec<u8>, Vec<u8>)> {
         match self {
             OnDiskIterator::Hash() => {
@@ -160,6 +202,24 @@ impl<M: MemPool> OnDiskIterator<M> {
             }
             OnDiskIterator::BTree(iter) => iter.lock().unwrap().next(),
             OnDiskIterator::Vec(iter) => iter.lock().unwrap().next(),
+            OnDiskIterator::Gensort(iter) => {
+                // For Gensort, split the record into key and value
+                iter.lock().unwrap().next().map(|record| {
+                    // Split the record into key (first 10 bytes) and value (remaining 90 bytes)
+                    let key = record[..RECORD_KEY_SIZE].to_vec();
+                    let value = record[RECORD_KEY_SIZE..].to_vec();
+                    (key, value)
+                })
+            }
+            OnDiskIterator::GensortRange(iter) => {
+                // For Gensort range scanner, split the record into key and value
+                iter.lock().unwrap().next().map(|record| {
+                    // Split the record into key (first 10 bytes) and value (remaining 90 bytes)
+                    let key = record[..RECORD_KEY_SIZE].to_vec();
+                    let value = record[RECORD_KEY_SIZE..].to_vec();
+                    (key, value)
+                })
+            }
         }
     }
 
@@ -176,6 +236,14 @@ impl<M: MemPool> OnDiskIterator<M> {
             OnDiskIterator::Vec(iter_mutex) => {
                 let mut iter = iter_mutex.lock().unwrap();
                 iter.seek_to_index(index)
+            }
+            OnDiskIterator::Gensort(_) => {
+                // XTX I think do should be easy
+                unimplemented!("seek not implemented for gensort")
+            }
+            OnDiskIterator::GensortRange(_) => {
+                // Range scanner handles seeking internally during creation
+                Ok(())
             }
         }
     }
@@ -545,6 +613,10 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
             Storage::BTreeMap(_) | Storage::HashMap() => {
                 unimplemented!()
             }
+            Storage::Gensort(gensort) => {
+                let scanner = gensort.create_range_scanner(start_index, end_index);
+                Ok(OnDiskIterator::GensortRange(Mutex::new(scanner)))
+            }
         }
     }
 
@@ -562,7 +634,8 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
                 scanner.seek_to_index(start_index)
                     .map_err(|e| TxnStorageStatus::AccessError(e))
             }
-            OnDiskIterator::BTree(_) | OnDiskIterator::Hash() => {
+            OnDiskIterator::GensortRange(_) => Ok(()),
+            OnDiskIterator::BTree(_) | OnDiskIterator::Hash() | OnDiskIterator::Gensort(_)=> {
                 unimplemented!()
             }
         }
