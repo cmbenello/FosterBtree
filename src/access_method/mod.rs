@@ -8,7 +8,6 @@ pub mod gensort_store;
 pub mod bloom_chain;
 pub mod chain;
 pub mod fbt;
-pub mod fbt_secondary;
 pub mod hash_fbt;
 pub mod hashindex;
 
@@ -16,27 +15,39 @@ pub mod hashindex;
 pub enum AccessMethodError {
     KeyNotFound,
     KeyDuplicate,
-    KeyNotInPageRange, // For Btree
+    NotEnoughMemory,
     PageReadLatchFailed,
     PageWriteLatchFailed,
     RecordTooLarge,
-    MemPoolStatus(MemPoolStatus),
     OutOfSpace, // For ReadOptimizedPage
     OutOfSpaceForUpdate(Vec<u8>),
     Other(String),
 }
 
+impl From<MemPoolStatus> for AccessMethodError {
+    fn from(status: MemPoolStatus) -> AccessMethodError {
+        match status {
+            MemPoolStatus::CannotEvictPage => AccessMethodError::NotEnoughMemory,
+            MemPoolStatus::FrameReadLatchGrantFailed => AccessMethodError::PageReadLatchFailed,
+            MemPoolStatus::FrameWriteLatchGrantFailed => AccessMethodError::PageWriteLatchFailed,
+            e => {
+                panic!("Unexpected MemPoolStatus: {:?}", e)
+            }
+        }
+    }
+}
+
 pub mod prelude {
     pub use super::append_only_store::prelude::*;
-    pub use super::bloom_chain::prelude::*;
     pub use super::chain::prelude::*;
     pub use super::fbt::prelude::*;
-    pub use super::fbt_secondary::prelude::*;
     pub use super::hash_fbt::prelude::*;
     pub use super::hashindex::prelude::*;
     pub use super::AccessMethodError;
     pub use super::{NonUniqueKeyIndex, OrderedUniqueKeyIndex, UniqueKeyIndex};
 }
+
+pub type FilterType = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
 pub trait UniqueKeyIndex {
     type Iter: Iterator<Item = (Vec<u8>, Vec<u8>)>;
@@ -52,10 +63,7 @@ pub trait UniqueKeyIndex {
         merge_fn: impl Fn(&[u8], &[u8]) -> Vec<u8>,
     ) -> Result<(), AccessMethodError>;
     fn scan(self: &Arc<Self>) -> Self::Iter;
-    fn scan_with_filter(
-        self: &Arc<Self>,
-        filter: Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>,
-    ) -> Self::Iter;
+    fn scan_with_filter(self: &Arc<Self>, filter: FilterType) -> Self::Iter;
 }
 
 pub trait OrderedUniqueKeyIndex: UniqueKeyIndex {
@@ -65,7 +73,7 @@ pub trait OrderedUniqueKeyIndex: UniqueKeyIndex {
         self: &Arc<Self>,
         start_key: &[u8],
         end_key: &[u8],
-        filter: Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>,
+        filter: FilterType,
     ) -> Self::RangeIter;
 }
 

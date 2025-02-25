@@ -8,7 +8,7 @@ use crate::access_method::{
         AccessMethodError};
 
 use super::{
-    ContainerOptions, ContainerType, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
+    ContainerDS, ContainerOptions, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
     TxnStorageTrait,
 };
 use crate::{
@@ -23,7 +23,6 @@ use crate::{
 };
 
 pub enum Storage<M: MemPool> {
-    HashMap(),
     BTreeMap(Arc<FosterBtree<M>>),
     AppendOnly(Arc<AppendOnlyStore<M>>),
     Gensort(Arc<GensortStore<M>>),
@@ -32,16 +31,16 @@ pub enum Storage<M: MemPool> {
 unsafe impl<M: MemPool> Sync for Storage<M> {}
 
 impl<M: MemPool> Storage<M> {
-    fn new(db_id: DatabaseId, c_id: ContainerId, c_type: ContainerType, bp: Arc<M>) -> Self {
+    fn new(db_id: DatabaseId, c_id: ContainerId, c_type: ContainerDS, bp: Arc<M>) -> Self {
         match c_type {
-            ContainerType::Hash => {
+            ContainerDS::Hash => {
                 unimplemented!("Hash container not implemented")
             }
-            ContainerType::BTree => Storage::BTreeMap(Arc::new(FosterBtree::<M>::new(
+            ContainerDS::BTree => Storage::BTreeMap(Arc::new(FosterBtree::<M>::new(
                 ContainerKey::new(db_id, c_id),
                 bp,
             ))),
-            ContainerType::AppendOnly => Storage::AppendOnly(Arc::new(AppendOnlyStore::<M>::new(
+            ContainerDS::AppendOnly => Storage::AppendOnly(Arc::new(AppendOnlyStore::<M>::new(
                 ContainerKey::new(db_id, c_id),
                 bp,
             ))),
@@ -52,17 +51,17 @@ impl<M: MemPool> Storage<M> {
         }
     }
 
-    fn load(db_id: DatabaseId, c_id: ContainerId, c_type: ContainerType, bp: Arc<M>) -> Self {
+    fn load(db_id: DatabaseId, c_id: ContainerId, c_type: ContainerDS, bp: Arc<M>) -> Self {
         match c_type {
-            ContainerType::Hash => {
+            ContainerDS::Hash => {
                 unimplemented!("Hash container not implemented")
             }
-            ContainerType::BTree => Storage::BTreeMap(Arc::new(FosterBtree::<M>::load(
+            ContainerDS::BTree => Storage::BTreeMap(Arc::new(FosterBtree::<M>::load(
                 ContainerKey::new(db_id, c_id),
                 bp,
                 0,
             ))),
-            ContainerType::AppendOnly => Storage::AppendOnly(Arc::new(AppendOnlyStore::<M>::load(
+            ContainerDS::AppendOnly => Storage::AppendOnly(Arc::new(AppendOnlyStore::<M>::load(
                 ContainerKey::new(db_id, c_id),
                 bp,
                 0,
@@ -77,9 +76,6 @@ impl<M: MemPool> Storage<M> {
 
     fn insert(&self, key: Vec<u8>, val: Vec<u8>) -> Result<(), TxnStorageStatus> {
         match self {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => b.insert(&key, &val)?,
             Storage::AppendOnly(v) => v.append(&key, &val)?,
             Storage::Gensort(g) => {
@@ -101,11 +97,8 @@ impl<M: MemPool> Storage<M> {
 
     fn get(&self, key: &[u8]) -> Result<Vec<u8>, TxnStorageStatus> {
         let result = match self {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => b.get(key)?,
-            Storage::AppendOnly(v) => {
+            Storage::AppendOnly(_v) => {
                 unimplemented!("get by key is not supported for append only container")
             }
             Storage::Gensort(_) => {
@@ -117,11 +110,8 @@ impl<M: MemPool> Storage<M> {
 
     fn update(&self, key: &[u8], val: Vec<u8>) -> Result<(), TxnStorageStatus> {
         match self {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => b.update(key, &val)?,
-            Storage::AppendOnly(v) => {
+            Storage::AppendOnly(_v) => {
                 unimplemented!("update by key is not supported for append only container")
             }
             Storage::Gensort(_) => {
@@ -133,11 +123,8 @@ impl<M: MemPool> Storage<M> {
 
     fn remove(&self, key: &[u8]) -> Result<(), TxnStorageStatus> {
         match self {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => b.delete(key)?,
-            Storage::AppendOnly(v) => {
+            Storage::AppendOnly(_v) => {
                 unimplemented!("remove by key is not supported for append only container")
             }
             Storage::Gensort(_) => {
@@ -149,9 +136,6 @@ impl<M: MemPool> Storage<M> {
 
     fn iter(self: &Arc<Self>) -> OnDiskIterator<M> {
         match self.as_ref() {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => OnDiskIterator::btree(b.scan()),
             Storage::AppendOnly(v) => OnDiskIterator::vec(v.scan()),
             Storage::Gensort(g) => OnDiskIterator::gensort(g.scan()),
@@ -160,9 +144,6 @@ impl<M: MemPool> Storage<M> {
 
     fn num_values(&self) -> usize {
         match self {
-            Storage::HashMap() => {
-                unimplemented!("Hash container not implemented")
-            }
             Storage::BTreeMap(b) => b.num_kvs(),
             Storage::AppendOnly(v) => v.num_kvs(),
             Storage::Gensort(g) => g.get_num_records(),
@@ -306,7 +287,7 @@ impl<M: MemPool> OnDiskStorage<M> {
         let iter = metadata.scan();
         for (k, v) in iter {
             let c_id = ContainerId::from_be_bytes(k.try_into().unwrap());
-            let c_type = ContainerType::from_bytes(&v);
+            let c_type = ContainerDS::from_bytes(&v);
             let storage = Storage::load(0, c_id, c_type, bp.clone());
             containers.push(Arc::new(storage));
         }
@@ -344,13 +325,13 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     }
 
     // Close connection with the db
-    fn close_db(&self, _db_id: &DatabaseId) -> Result<(), TxnStorageStatus> {
+    fn close_db(&self, _db_id: DatabaseId) -> Result<(), TxnStorageStatus> {
         // Do nothing
         Ok(())
     }
 
     // Delete the db
-    fn delete_db(&self, _db_id: &DatabaseId) -> Result<(), TxnStorageStatus> {
+    fn delete_db(&self, _db_id: DatabaseId) -> Result<(), TxnStorageStatus> {
         // Clear all the containers
         let containers = unsafe { &mut *self.containers.get() };
         containers.clear();
@@ -360,26 +341,25 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     // Create a container in the db
     fn create_container(
         &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
+        db_id: DatabaseId,
         options: ContainerOptions,
     ) -> Result<ContainerId, TxnStorageStatus> {
-        if *db_id != 0 {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.write().unwrap();
         let containers = unsafe { &mut *self.containers.get() };
         let c_id = containers.len();
         let storage = Arc::new(Storage::new(
-            *db_id,
+            db_id,
             c_id as ContainerId,
-            options.get_type(),
+            options.data_structure(),
             self.bp.clone(),
         ));
         self.metadata
             .insert(
                 &(c_id as ContainerId).to_be_bytes(),
-                &options.get_type().to_bytes(),
+                &options.data_structure().to_bytes(),
             )
             .unwrap();
         containers.push(storage);
@@ -392,27 +372,22 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     // TODO: Make list_containers return only non-empty containers
     fn delete_container(
         &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
-        c_id: &ContainerId,
+        db_id: DatabaseId,
+        c_id: ContainerId,
     ) -> Result<(), TxnStorageStatus> {
-        if *db_id != 0 {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.write().unwrap();
         let containers = unsafe { &mut *self.containers.get() };
         self.metadata.delete(&c_id.to_be_bytes()).unwrap();
-        containers[*c_id as usize].clear();
+        containers[c_id as usize].clear();
         Ok(())
     }
 
     // List all container names in the db
-    fn list_containers(
-        &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
-    ) -> Result<HashSet<ContainerId>, TxnStorageStatus> {
-        if *db_id != 0 {
+    fn list_containers(&self, db_id: DatabaseId) -> Result<HashSet<ContainerId>, TxnStorageStatus> {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.read().unwrap();
@@ -420,13 +395,23 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
         Ok((0..containers.len() as ContainerId).collect())
     }
 
+    fn raw_insert_value(
+        &self,
+        _db_id: DatabaseId,
+        _c_id: ContainerId,
+        _key: Vec<u8>,
+        _value: Vec<u8>,
+    ) -> Result<(), TxnStorageStatus> {
+        unimplemented!()
+    }
+
     // Begin a transaction
     fn begin_txn(
         &self,
-        db_id: &DatabaseId,
+        db_id: DatabaseId,
         _options: TxnOptions,
     ) -> Result<Self::TxnHandle, TxnStorageStatus> {
-        Ok(OnDiskDummyTxnHandle::new(*db_id))
+        Ok(OnDiskDummyTxnHandle::new(db_id))
     }
 
     // Commit a transaction
@@ -456,10 +441,10 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn num_values(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
     ) -> Result<usize, TxnStorageStatus> {
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         Ok(storage.num_values())
     }
 
@@ -467,14 +452,14 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn check_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<bool, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         match storage.get(key.as_ref()) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
@@ -485,14 +470,14 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn get_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<Vec<u8>, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.get(key.as_ref())
     }
 
@@ -500,7 +485,7 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn insert_value(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<(), TxnStorageStatus> {
@@ -508,7 +493,7 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.insert(key, value)
     }
 
@@ -516,14 +501,14 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn insert_values(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         kvs: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         for (k, v) in kvs {
             storage.insert(k, v)?;
         }
@@ -534,7 +519,7 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn update_value<K>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
         value: Vec<u8>,
     ) -> Result<(), TxnStorageStatus>
@@ -545,22 +530,32 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.update(key.as_ref(), value)
+    }
+
+    fn update_value_with_func<K: AsRef<[u8]>, F: FnOnce(&mut [u8])>(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: ContainerId,
+        _key: K,
+        _func: F,
+    ) -> Result<(), TxnStorageStatus> {
+        unimplemented!()
     }
 
     // Delete value
     fn delete_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<(), TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.remove(key.as_ref())
     }
 
@@ -568,19 +563,20 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
     fn scan_range(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         _options: ScanOptions,
     ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        Ok(containers[*c_id as usize].iter())
+        Ok(containers[c_id as usize].iter())
     }
 
     // Iterate next
     fn iter_next(
         &self,
+        _txn: &Self::TxnHandle,
         iter: &Self::IteratorHandle,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, TxnStorageStatus> {
         Ok(iter.next())

@@ -1,13 +1,10 @@
 use clap::Parser;
 use core::panic;
 use fbtree::{
-    access_method::UniqueKeyIndex,
     bp::{get_test_bp, BufferPool},
     prelude::{AppendOnlyStore, PAGE_SIZE},
     random::gen_random_byte_vec,
 };
-use rand::prelude::Distribution;
-use rand::Rng;
 use std::{sync::Arc, time::Duration};
 
 use fbtree::bp::{ContainerKey, MemPool};
@@ -36,31 +33,6 @@ fn get_key_bytes(key: usize, key_size: usize) -> Vec<u8> {
     let bytes = key.to_be_bytes().to_vec();
     key_vec[key_size - bytes.len()..].copy_from_slice(&bytes);
     key_vec
-}
-
-fn from_key_bytes(key: &[u8]) -> usize {
-    // The last 8 bytes of the key is the key
-
-    usize::from_be_bytes(
-        key[key.len() - std::mem::size_of::<usize>()..]
-            .try_into()
-            .unwrap(),
-    )
-}
-
-fn get_key(num_keys: usize, skew_factor: f64) -> usize {
-    let mut rng = rand::thread_rng();
-    if skew_factor <= 0f64 {
-        rng.gen_range(0..num_keys)
-    } else {
-        let zipf = zipf::ZipfDistribution::new(num_keys, skew_factor).unwrap();
-        let sample = zipf.sample(&mut rng);
-        sample - 1
-    }
-}
-
-fn get_new_value(value_size: usize) -> Vec<u8> {
-    gen_random_byte_vec(value_size, value_size)
 }
 
 pub struct KeyValueGenerator {
@@ -150,7 +122,7 @@ fn main() {
     println!("Loading table...");
     load_table(&params, &table);
 
-    println!("Buffer pool stats after load: {:?}", bp.stats());
+    println!("Buffer pool stats after load: {}", bp.stats());
 
     println!("Num KVs: {}", table.num_kvs());
     println!("Num pages: {}", table.num_pages());
@@ -172,7 +144,7 @@ fn main() {
         let dur = execute_workload(&params, table.clone());
         total_time += dur;
         println!("Scan {} took {:?}", i, dur);
-        println!("Buffer pool stats after exec: {:?}", bp.stats());
+        println!("Buffer pool stats after exec: {}", bp.stats());
         bp.flush_all().unwrap();
         bp.reset_stats();
     }

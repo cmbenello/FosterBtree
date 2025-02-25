@@ -682,7 +682,11 @@ impl<T: MemPool> PagedHashMapIter<T> {
     fn initialize(&mut self) {
         assert!(!self.initialized);
         let page_key = PageFrameKey::new(self.map.c_key, 1);
-        let first_page = unsafe { std::mem::transmute(self.map.read_page(page_key)) };
+        let first_page = unsafe {
+            std::mem::transmute::<FrameReadGuard, FrameReadGuard<'static>>(
+                self.map.read_page(page_key),
+            )
+        };
         self.current_page = Some(first_page);
     }
 }
@@ -1012,8 +1016,10 @@ mod stat {
 
 #[cfg(test)]
 mod tests {
+    use crate::random::small_thread_rng;
+
     use super::*;
-    use rand::{distributions::Alphanumeric, Rng};
+    use rand::{distr::Alphanumeric, Rng};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1033,10 +1039,9 @@ mod tests {
 
     /// Helper function to generate random strings of a given length
     fn random_string(length: usize) -> Vec<u8> {
-        rand::thread_rng()
+        small_thread_rng()
             .sample_iter(&Alphanumeric)
             .take(length)
-            .map(|c| c as u8)
             .collect()
     }
 
@@ -1160,14 +1165,14 @@ mod tests {
     fn test_random_operations_without_remove() {
         // let mut map = Arc::new(setup_paged_hash_map(get_in_mem_pool()));
         let map = setup_paged_hash_map(get_in_mem_pool());
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut data = HashMap::new();
         let mut inserted_keys = Vec::new(); // Track keys that are currently valid for removal
 
         let func = simple_hash_func;
 
         for _ in 0..20000 {
-            let operation: u8 = rng.gen_range(0..3);
+            let operation: u8 = rng.random_range(0..3);
             let key = random_string(10);
             let value = random_string(20);
 
@@ -1207,7 +1212,7 @@ mod tests {
                 }
                 3 if !inserted_keys.is_empty() => {
                     // Remove
-                    let remove_index = rng.gen_range(0..inserted_keys.len());
+                    let remove_index = rng.random_range(0..inserted_keys.len());
                     let remove_key = inserted_keys.remove(remove_index);
                     assert!(
                         map.remove(&remove_key).is_some(),
@@ -1457,14 +1462,14 @@ mod tests {
     fn test_random_operations() {
         // let mut map = Arc::new(setup_paged_hash_map(get_in_mem_pool()));
         let map = setup_paged_hash_map(get_in_mem_pool());
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut data = HashMap::new();
         let mut inserted_keys = Vec::new(); // Track keys that are currently valid for removal
 
         let func = simple_hash_func;
 
         for _ in 0..1000 {
-            let operation: u8 = rng.gen_range(0..4);
+            let operation: u8 = rng.random_range(0..4);
             let key = random_string(10);
             let value = random_string(20);
 
@@ -1504,7 +1509,7 @@ mod tests {
                 }
                 3 if !inserted_keys.is_empty() => {
                     // Remove
-                    let remove_index = rng.gen_range(0..inserted_keys.len());
+                    let remove_index = rng.random_range(0..inserted_keys.len());
                     let remove_key = inserted_keys.remove(remove_index);
                     assert!(
                         map.remove(&remove_key).is_some(),
@@ -1524,12 +1529,12 @@ mod tests {
     #[test]
     fn test_random_operations2() {
         let map = Arc::new(setup_paged_hash_map(get_in_mem_pool()));
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut data = HashMap::new();
         let mut inserted_keys = Vec::new(); // Track keys that are currently valid for removal
 
         for _ in 0..1000 {
-            let operation: u8 = rng.gen_range(0..4);
+            let operation: u8 = rng.random_range(0..4);
             let key = random_string(10);
             let value = random_string(20);
 
@@ -1569,7 +1574,7 @@ mod tests {
                 }
                 3 if !inserted_keys.is_empty() => {
                     // Remove
-                    let remove_index = rng.gen_range(0..inserted_keys.len());
+                    let remove_index = rng.random_range(0..inserted_keys.len());
                     let remove_key = inserted_keys.remove(remove_index);
                     assert!(
                         map.remove(&remove_key).is_some(),
@@ -1649,12 +1654,12 @@ mod tests {
     //         let barrier_clone = Arc::clone(&barrier);
     //         handles.push(thread::spawn(move || {
     //             barrier_clone.wait(); // Ensure all threads start at the same time
-    //             let mut rng = thread_rng();
+    //             let mut rng = small_thread_rng();
 
     //             for _ in 0..num_operations_per_thread {
     //                 let key = random_string(10);
     //                 let value = random_string(20);
-    //                 let operation: u8 = rng.gen_range(0..4);
+    //                 let operation: u8 = rng.random_range(0..4);
 
     //                 match operation {
     //                     0 => { // Insert

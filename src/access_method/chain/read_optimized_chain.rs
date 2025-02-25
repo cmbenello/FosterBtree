@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    fmt::Display,
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
@@ -7,10 +7,10 @@ use std::{
 #[allow(unused_imports)]
 use crate::log;
 use crate::{
-    access_method::AccessMethodError,
+    access_method::{AccessMethodError, FilterType},
     bp::prelude::*,
-    log_debug, log_info, log_trace, log_warn,
-    page::{Page, PageId, PAGE_SIZE},
+    log_debug, log_info, log_trace,
+    page::{Page, PageId},
 };
 
 use super::read_optimized_page::ReadOptimizedPage;
@@ -476,7 +476,6 @@ impl<T: MemPool> ReadOptimizedChain<T> {
                                 return Err(e);
                             }
                         }
-                        return Ok(upgraded_page);
                     }
                     Err(_) => {
                         log_debug!("Failed to upgrade the page. Will retry");
@@ -499,7 +498,7 @@ impl<T: MemPool> ReadOptimizedChain<T> {
         self: &Arc<Self>,
         l_key: &[u8],
         r_key: &[u8],
-        filter: FilterFunc,
+        filter: FilterType,
     ) -> ReadOptimizedChainRangeScanner<T> {
         ReadOptimizedChainRangeScanner::new_with_filter(self, l_key, r_key, filter)
     }
@@ -520,8 +519,6 @@ fn fix_frame_id<'a>(this: FrameReadGuard<'a>, new_frame_key: &PageFrameKey) -> F
     }
 }
 
-type FilterFunc = Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
-
 /// Scan the Chain in the range [l_key, r_key)
 /// To specify all keys, use an empty slice.
 /// (l_key, r_key) = (&[], &[]) means [-inf, +inf)
@@ -531,7 +528,7 @@ pub struct ReadOptimizedChainRangeScanner<T: MemPool> {
     // Scan parameters
     l_key: Vec<u8>,
     r_key: Vec<u8>,
-    filter: Option<FilterFunc>,
+    filter: Option<FilterType>,
 
     // States
     initialized: bool,
@@ -561,7 +558,7 @@ impl<T: MemPool> ReadOptimizedChainRangeScanner<T> {
         chain: &Arc<ReadOptimizedChain<T>>,
         l_key: &[u8],
         r_key: &[u8],
-        filter: FilterFunc,
+        filter: FilterType,
     ) -> Self {
         let (l_key, r_key) = Self::normalize_keys(l_key, r_key);
         Self {
@@ -585,14 +582,7 @@ impl<T: MemPool> ReadOptimizedChainRangeScanner<T> {
             l_key.to_vec()
         };
 
-        let r_key = if r_key.is_empty() {
-            r_key.to_vec() // do not check when empty
-                           // vec![255; 255] // Maximum possible value
-        } else {
-            r_key.to_vec()
-        };
-
-        (l_key, r_key)
+        (l_key, r_key.to_vec())
     }
 
     fn initialize(&mut self) {
@@ -766,8 +756,10 @@ impl PageStatsGenerator {
     fn new() -> Self {
         Self { stats: Vec::new() }
     }
+}
 
-    fn to_string(&self) -> String {
+impl Display for PageStatsGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Print the min, avg, max of slot count, total bytes used, total free space
 
         let mut slot_count = Vec::new();
@@ -806,7 +798,7 @@ impl PageStatsGenerator {
             "Total free space: min={}, avg={}, max={}\n",
             min_free_space, avg_free_space, max_free_space
         ));
-        result
+        write!(f, "{}", result)
     }
 }
 

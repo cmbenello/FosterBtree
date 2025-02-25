@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{
-    ContainerOptions, ContainerType, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
+    ContainerDS, ContainerOptions, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
     TxnStorageTrait,
 };
 use crate::bp::prelude::{ContainerId, DatabaseId};
@@ -20,15 +20,15 @@ pub enum Storage {
 unsafe impl Sync for Storage {}
 
 impl Storage {
-    fn new(c_type: ContainerType) -> Self {
+    fn new(c_type: ContainerDS) -> Self {
         match c_type {
-            ContainerType::Hash => {
+            ContainerDS::Hash => {
                 Storage::HashMap(RwLatch::default(), UnsafeCell::new(HashMap::new()))
             }
-            ContainerType::BTree => {
+            ContainerDS::BTree => {
                 Storage::BTreeMap(RwLatch::default(), UnsafeCell::new(BTreeMap::new()))
             }
-            ContainerType::AppendOnly => {
+            ContainerDS::AppendOnly => {
                 Storage::AppendOnly(RwLatch::default(), UnsafeCell::new(Vec::new()))
             }
             ContainerType::Gensort => unimplemented!("Gensort only works for ondisk rn")
@@ -308,24 +308,24 @@ impl InMemIterator {
 
 /// Assumptions of InMemStorage:
 /// 1. Creation and deletion of the database is not thread-safe. This means, you can't create
-/// or delete a database while other threads are accessing the database.
+///    or delete a database while other threads are accessing the database.
 /// 2. Creation and deletion of a container is thread-safe with respect to other containers.
-/// However, deletion of a container is not thread-safe with respect to other threads accessing
-/// the same container that is being deleted. You have to make sure that no other threads are
-/// accessing the container while you are deleting. You also have to make sure that before you
-/// access the container, the container is already created (the create_container() has returned
-/// without error). If you try to access a container that is not created, it will panic as
-/// there is no container at that index in the containers vector.
+///    However, deletion of a container is not thread-safe with respect to other threads accessing
+///    the same container that is being deleted. You have to make sure that no other threads are
+///    accessing the container while you are deleting. You also have to make sure that before you
+///    access the container, the container is already created (the create_container() has returned
+///    without error). If you try to access a container that is not created, it will panic as
+///    there is no container at that index in the containers vector.
 /// 3. Accessing the container must be thread-safe. This means, you can concurrently access
-/// the container from multiple threads. insert, get, update, remove, scan_range, iter_next
-/// should be thread-safe. In the case of InMemStorage, while iterator is alive, insert,
-/// update, remove should be blocked. get and scan_range should be allowed because they are
-/// read-only operations.
+///    the container from multiple threads. insert, get, update, remove, scan_range, iter_next
+///    should be thread-safe. In the case of InMemStorage, while iterator is alive, insert,
+///    update, remove should be blocked. get and scan_range should be allowed because they are
+///    read-only operations.
 /// 4. For simplicity, a single database can be created. If you try to create multiple databases,
-/// it will return DBExists error.
+///    it will return DBExists error.
 /// 5. The iterator next() must not be called using multiple threads. next() is not thread-safe with
-/// respect to other next() calls of the same iterator. However, next() is thread-safe with respect
-/// to other operations on the same container including next() of other iterators.
+///    respect to other next() calls of the same iterator. However, next() is thread-safe with respect
+///    to other operations on the same container including next() of other iterators.
 pub struct InMemStorage {
     db_created: UnsafeCell<bool>,
     container_lock: RwLock<()>, // lock for container operations
@@ -380,14 +380,14 @@ impl TxnStorageTrait for InMemStorage {
     }
 
     // Close connection with the db
-    fn close_db(&self, _db_id: &DatabaseId) -> Result<(), TxnStorageStatus> {
+    fn close_db(&self, _db_id: DatabaseId) -> Result<(), TxnStorageStatus> {
         // Do nothing
         Ok(())
     }
 
     // Delete the db
-    fn delete_db(&self, db_id: &DatabaseId) -> Result<(), TxnStorageStatus> {
-        if *db_id != 0 {
+    fn delete_db(&self, db_id: DatabaseId) -> Result<(), TxnStorageStatus> {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let guard = unsafe { &mut *self.db_created.get() };
@@ -401,16 +401,15 @@ impl TxnStorageTrait for InMemStorage {
     // Create a container in the db
     fn create_container(
         &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
+        db_id: DatabaseId,
         options: ContainerOptions,
     ) -> Result<ContainerId, TxnStorageStatus> {
-        if *db_id != 0 {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.write().unwrap();
         let containers = unsafe { &mut *self.containers.get() };
-        let storage = Arc::new(Storage::new(options.get_type()));
+        let storage = Arc::new(Storage::new(options.data_structure()));
         containers.push(storage);
         Ok((containers.len() - 1) as ContainerId)
     }
@@ -421,26 +420,21 @@ impl TxnStorageTrait for InMemStorage {
     // TODO: Make list_containers return only non-empty containers
     fn delete_container(
         &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
-        c_id: &ContainerId,
+        db_id: DatabaseId,
+        c_id: ContainerId,
     ) -> Result<(), TxnStorageStatus> {
-        if *db_id != 0 {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.write().unwrap();
         let containers = unsafe { &mut *self.containers.get() };
-        containers[*c_id as usize].clear();
+        containers[c_id as usize].clear();
         Ok(())
     }
 
     // List all container names in the db
-    fn list_containers(
-        &self,
-        _txn: &Self::TxnHandle,
-        db_id: &DatabaseId,
-    ) -> Result<HashSet<ContainerId>, TxnStorageStatus> {
-        if *db_id != 0 {
+    fn list_containers(&self, db_id: DatabaseId) -> Result<HashSet<ContainerId>, TxnStorageStatus> {
+        if db_id != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let _guard = self.container_lock.read().unwrap();
@@ -448,13 +442,23 @@ impl TxnStorageTrait for InMemStorage {
         Ok((0..containers.len() as ContainerId).collect())
     }
 
+    fn raw_insert_value(
+        &self,
+        _db_id: DatabaseId,
+        _c_id: ContainerId,
+        _key: Vec<u8>,
+        _value: Vec<u8>,
+    ) -> Result<(), TxnStorageStatus> {
+        unimplemented!()
+    }
+
     // Begin a transaction
     fn begin_txn(
         &self,
-        db_id: &DatabaseId,
+        db_id: DatabaseId,
         _options: TxnOptions,
     ) -> Result<Self::TxnHandle, TxnStorageStatus> {
-        Ok(InMemDummyTxnHandle::new(*db_id))
+        Ok(InMemDummyTxnHandle::new(db_id))
     }
 
     // Commit a transaction
@@ -484,27 +488,27 @@ impl TxnStorageTrait for InMemStorage {
     fn num_values(
         &self,
         txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
     ) -> Result<usize, TxnStorageStatus> {
         if txn.db_id() != 0 {
             return Err(TxnStorageStatus::DBNotFound);
         }
         let containers = unsafe { &*self.containers.get() };
-        Ok(containers[*c_id as usize].num_values())
+        Ok(containers[c_id as usize].num_values())
     }
 
     // Check if value exists
     fn check_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<bool, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         match storage.get(key.as_ref()) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
@@ -515,14 +519,14 @@ impl TxnStorageTrait for InMemStorage {
     fn get_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<Vec<u8>, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.get(key.as_ref())
     }
 
@@ -530,7 +534,7 @@ impl TxnStorageTrait for InMemStorage {
     fn insert_value(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<(), TxnStorageStatus> {
@@ -538,7 +542,7 @@ impl TxnStorageTrait for InMemStorage {
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.insert(key, value)
     }
 
@@ -546,14 +550,14 @@ impl TxnStorageTrait for InMemStorage {
     fn insert_values(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         kvs: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         for (k, v) in kvs {
             storage.insert(k, v)?;
         }
@@ -564,7 +568,7 @@ impl TxnStorageTrait for InMemStorage {
     fn update_value<K>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
         value: Vec<u8>,
     ) -> Result<(), TxnStorageStatus>
@@ -575,22 +579,32 @@ impl TxnStorageTrait for InMemStorage {
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.update(key.as_ref(), value)
+    }
+
+    fn update_value_with_func<K: AsRef<[u8]>, F: FnOnce(&mut [u8])>(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: ContainerId,
+        _key: K,
+        _func: F,
+    ) -> Result<(), TxnStorageStatus> {
+        unimplemented!()
     }
 
     // Delete value
     fn delete_value<K: AsRef<[u8]>>(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         key: K,
     ) -> Result<(), TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        let storage = containers[*c_id as usize].as_ref();
+        let storage = containers[c_id as usize].as_ref();
         storage.remove(key.as_ref())
     }
 
@@ -598,19 +612,20 @@ impl TxnStorageTrait for InMemStorage {
     fn scan_range(
         &self,
         _txn: &Self::TxnHandle,
-        c_id: &ContainerId,
+        c_id: ContainerId,
         _options: ScanOptions,
     ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
         // Access the container with the container_id. No guard
         // is required because we assume that container is
         // already created.
         let containers = unsafe { &*self.containers.get() };
-        Ok(containers[*c_id as usize].iter())
+        Ok(containers[c_id as usize].iter())
     }
 
     // Iterate next
     fn iter_next(
         &self,
+        _txn: &Self::TxnHandle,
         iter: &Self::IteratorHandle,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, TxnStorageStatus> {
         Ok(iter.next())

@@ -9,10 +9,7 @@ use std::{
     cell::UnsafeCell,
     fmt::Debug,
     ops::{Deref, DerefMut},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        RwLock,
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 type EvictionPolicyType = LRUEvictionPolicy;
@@ -21,9 +18,9 @@ pub struct BufferFrame {
     frame_id: u32, // An index of the frame in the buffer pool. This is a constant value.
     latch: RwLatch,
     is_dirty: AtomicBool, // Can be updated even when ReadGuard is held (see flush_all() in buffer_pool.rs)
-    evict_info: RwLock<EvictionPolicyType>, // Can be updated even when ReadGuard is held (see get_page_for_read() in buffer_pool.rs)
-    key: UnsafeCell<Option<PageKey>>,       // Can only be updated when WriteGuard is held
-    page: UnsafeCell<Page>,                 // Can only be updated when WriteGuard is held
+    evict_info: EvictionPolicyType, // Can be updated even when ReadGuard is held (see get_page_for_read() in buffer_pool.rs). Interior mutability must be used.
+    key: UnsafeCell<Option<PageKey>>, // Can only be updated when WriteGuard is held
+    page: UnsafeCell<Page>,         // Can only be updated when WriteGuard is held
 }
 
 unsafe impl Sync for BufferFrame {}
@@ -35,13 +32,17 @@ impl BufferFrame {
             latch: RwLatch::default(),
             is_dirty: AtomicBool::new(false),
             key: UnsafeCell::new(None),
-            evict_info: RwLock::new(EvictionPolicyType::new()),
+            evict_info: EvictionPolicyType::new(),
             page: UnsafeCell::new(Page::new_empty()),
         }
     }
 
     pub fn frame_id(&self) -> u32 {
         self.frame_id
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.is_dirty.load(Ordering::Relaxed)
     }
 
     pub fn read(&self) -> FrameReadGuard {
@@ -117,7 +118,7 @@ impl<'a> FrameReadGuard<'a> {
         &self.buffer_frame.is_dirty
     }
 
-    pub fn evict_info(&self) -> &RwLock<EvictionPolicyType> {
+    pub fn evict_info(&self) -> &EvictionPolicyType {
         &self.buffer_frame.evict_info
     }
 
@@ -137,7 +138,7 @@ impl<'a> FrameReadGuard<'a> {
     }
 }
 
-impl<'a> Drop for FrameReadGuard<'a> {
+impl Drop for FrameReadGuard<'_> {
     fn drop(&mut self) {
         if !self.upgraded.load(Ordering::Relaxed) {
             self.buffer_frame.latch.release_shared();
@@ -193,16 +194,12 @@ impl<'a> FrameWriteGuard<'a> {
         &self.buffer_frame.is_dirty
     }
 
-    pub fn evict_info(&self) -> &RwLock<EvictionPolicyType> {
+    pub fn evict_info(&self) -> &EvictionPolicyType {
         &self.buffer_frame.evict_info
     }
 
     pub fn eviction_score(&self) -> u64 {
-        self.buffer_frame
-            .evict_info
-            .read()
-            .unwrap()
-            .score(self.buffer_frame)
+        self.buffer_frame.evict_info.score(self.buffer_frame)
     }
 
     pub fn downgrade(self) -> FrameReadGuard<'a> {
@@ -216,12 +213,12 @@ impl<'a> FrameWriteGuard<'a> {
 
     pub fn clear(&mut self) {
         self.buffer_frame.is_dirty.store(false, Ordering::Release);
-        self.buffer_frame.evict_info.write().unwrap().reset();
+        self.buffer_frame.evict_info.reset();
         self.page_key_mut().take();
     }
 }
 
-impl<'a> Drop for FrameWriteGuard<'a> {
+impl Drop for FrameWriteGuard<'_> {
     fn drop(&mut self) {
         if !self.downgraded.load(Ordering::Relaxed) {
             self.buffer_frame.latch.release_exclusive();

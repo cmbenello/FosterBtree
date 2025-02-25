@@ -919,6 +919,8 @@ impl ShortKeyPage for Page {
 
 #[cfg(test)]
 mod tests {
+    use crate::random::small_thread_rng;
+
     use super::*;
     use rand::Rng;
 
@@ -927,10 +929,9 @@ mod tests {
     }
 
     fn random_string(length: usize) -> Vec<u8> {
-        rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        small_thread_rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .take(length)
-            .map(|c| c as u8)
             .collect()
     }
 
@@ -985,7 +986,7 @@ mod tests {
     #[test]
     fn test_upsert_multiple_keys_ordering() {
         let mut page = <Page as ShortKeyPage>::new();
-        let keys = vec![
+        let keys = [
             (b"alpha", b"value_alpha"),
             (b"gamma", b"value_gamma"),
             (b"betaa", b"value_betaa"),
@@ -1072,13 +1073,13 @@ mod tests {
     #[test]
     fn stress_test_random_keys_and_values() {
         let mut page = <Page as ShortKeyPage>::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut keys_and_values = vec![];
 
         for _ in 0..40 {
             // Adjust the number for more intense testing
-            let key: Vec<u8> = (0..8).map(|_| rng.gen_range(0x00..0xFF)).collect();
-            let value: Vec<u8> = (0..50).map(|_| rng.gen_range(0x00..0xFF)).collect(); // Random length values
+            let key: Vec<u8> = (0..8).map(|_| rng.random_range(0x00..0xFF)).collect();
+            let value: Vec<u8> = (0..50).map(|_| rng.random_range(0x00..0xFF)).collect(); // Random length values
             keys_and_values.push((key.clone(), value.clone()));
             assert_eq!(page.upsert(&key, &value), (true, None));
         }
@@ -1092,13 +1093,13 @@ mod tests {
     #[test]
     fn stress_test_random_keys_and_values_with_order() {
         let mut page = <Page as ShortKeyPage>::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut keys_and_values = vec![];
 
         for _ in 0..40 {
             // Adjust the number for more intense testing
-            let key: Vec<u8> = (0..8).map(|_| rng.gen_range(0x00..0xFF)).collect();
-            let value: Vec<u8> = (0..50).map(|_| rng.gen_range(0x00..0xFF)).collect(); // Random length values
+            let key: Vec<u8> = (0..8).map(|_| rng.random_range(0x00..0xFF)).collect();
+            let value: Vec<u8> = (0..50).map(|_| rng.random_range(0x00..0xFF)).collect(); // Random length values
             keys_and_values.push((key.clone(), value.clone()));
             assert_eq!(page.upsert(&key, &value), (true, None));
         }
@@ -1135,7 +1136,7 @@ mod tests {
         let keys: Vec<&[u8]> = vec![b"delta", b"alpha", b"echo", b"bravo", b"charlie"];
 
         for key in keys.iter() {
-            page.upsert(*key, b"value");
+            page.upsert(key, b"value");
         }
 
         let mut retrieved_keys = vec![];
@@ -1269,13 +1270,13 @@ mod tests {
     #[test]
     fn stress_test_random_keys_and_values_with_merge() {
         let mut page = <Page as ShortKeyPage>::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut keys_and_values = vec![];
 
         for _ in 0..40 {
             // Adjust the number for more intense testing
-            let key: Vec<u8> = (0..8).map(|_| rng.gen_range(0x00..0xFF)).collect();
-            let value: Vec<u8> = (0..50).map(|_| rng.gen_range(0x00..0xFF)).collect(); // Random length values
+            let key: Vec<u8> = (0..8).map(|_| rng.random_range(0x00..0xFF)).collect();
+            let value: Vec<u8> = (0..50).map(|_| rng.random_range(0x00..0xFF)).collect(); // Random length values
             keys_and_values.push((key.clone(), value.clone()));
             assert_eq!(
                 page.upsert_with_merge(&key, &value, update_fn),
@@ -1292,13 +1293,13 @@ mod tests {
     #[test]
     fn stress_test_random_keys_and_values_with_merge_and_order() {
         let mut page = <Page as ShortKeyPage>::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut keys_and_values = vec![];
 
         for _ in 0..40 {
             // Adjust the number for more intense testing
-            let key: Vec<u8> = (0..8).map(|_| rng.gen_range(0x00..0xFF)).collect();
-            let value: Vec<u8> = (0..50).map(|_| rng.gen_range(0x00..0xFF)).collect(); // Random length values
+            let key: Vec<u8> = (0..8).map(|_| rng.random_range(0x00..0xFF)).collect();
+            let value: Vec<u8> = (0..50).map(|_| rng.random_range(0x00..0xFF)).collect(); // Random length values
             keys_and_values.push((key.clone(), value.clone()));
             assert_eq!(
                 page.upsert_with_merge(&key, &value, update_fn),
@@ -1338,7 +1339,7 @@ mod tests {
         let keys: Vec<&[u8]> = vec![b"delta", b"alpha", b"echo", b"bravo", b"charlie"];
 
         for key in keys.iter() {
-            page.upsert_with_merge(*key, b"value", update_fn);
+            page.upsert_with_merge(key, b"value", update_fn);
         }
 
         let mut retrieved_keys = vec![];
@@ -1492,12 +1493,12 @@ mod tests {
     #[test]
     fn stress_test_multiple_operations() {
         let mut page = <Page as ShortKeyPage>::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = small_thread_rng();
         let mut keys_and_values = vec![];
         let mut inserted_keys = vec![];
 
         for _ in 0..20 {
-            let operation: u8 = rng.gen_range(0..4);
+            let operation: u8 = rng.random_range(0..4);
             let key = random_string(100);
             let value = random_string(20);
 
@@ -1512,9 +1513,10 @@ mod tests {
                 1 => {
                     // Update
                     if !inserted_keys.is_empty() {
-                        let key_to_update = &inserted_keys[rng.gen_range(0..inserted_keys.len())];
+                        let key_to_update =
+                            &inserted_keys[rng.random_range(0..inserted_keys.len())];
                         let new_value = random_string(20);
-                        if page.update(&key_to_update, &new_value).is_ok() {
+                        if page.update(key_to_update, &new_value).is_ok() {
                             keys_and_values.retain(|(k, _)| k != key_to_update);
                             keys_and_values.push((key_to_update.clone(), new_value.clone()));
                         }
@@ -1523,19 +1525,19 @@ mod tests {
                 2 => {
                     // Get
                     if !inserted_keys.is_empty() {
-                        let key_to_get = &inserted_keys[rng.gen_range(0..inserted_keys.len())];
+                        let key_to_get = &inserted_keys[rng.random_range(0..inserted_keys.len())];
                         let expected_value = keys_and_values
                             .iter()
                             .find(|(k, _)| k == key_to_get)
                             .map(|(_, v)| v.clone());
-                        assert_eq!(page.get(&key_to_get), expected_value);
+                        assert_eq!(page.get(key_to_get), expected_value);
                     }
                 }
                 3 => {
                     // Remove
                     if !inserted_keys.is_empty() {
                         let key_to_remove =
-                            inserted_keys.remove(rng.gen_range(0..inserted_keys.len()));
+                            inserted_keys.remove(rng.random_range(0..inserted_keys.len()));
                         let expected_value = keys_and_values
                             .iter()
                             .find(|(k, _)| *k == key_to_remove)

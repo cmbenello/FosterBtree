@@ -1,13 +1,13 @@
 use std::{
     cell::UnsafeCell,
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
 };
 
-use crate::{page::Page, rwlatch::RwLatch};
+use crate::rwlatch::RwLatch;
 
 use super::{
     buffer_frame::BufferFrame,
-    mem_pool_trait::{MemPool, PageKey},
+    mem_pool_trait::{MemPool, MemoryStats, PageKey},
     prelude::{ContainerKey, FrameReadGuard, FrameWriteGuard, MemPoolStatus, PageFrameKey},
 };
 
@@ -16,11 +16,10 @@ use super::{
 /// A latch is used to synchronize access to the pool.
 /// An exclusive latch is required to create a new page and append it to the pool.
 /// Getting a page for read or write requires a shared latch.
-
 pub struct InMemPool {
     latch: RwLatch,
     frames: UnsafeCell<Vec<Box<BufferFrame>>>, // Box is required to ensure that the frame does not move when the vector is resized
-    id_to_index: UnsafeCell<HashMap<PageKey, usize>>,
+    page_to_frame: UnsafeCell<HashMap<PageKey, usize>>,
     container_page_count: UnsafeCell<HashMap<ContainerKey, u32>>,
 }
 
@@ -35,7 +34,7 @@ impl InMemPool {
         InMemPool {
             latch: RwLatch::default(),
             frames: UnsafeCell::new(Vec::new()),
-            id_to_index: UnsafeCell::new(HashMap::new()),
+            page_to_frame: UnsafeCell::new(HashMap::new()),
             container_page_count: UnsafeCell::new(HashMap::new()),
         }
     }
@@ -64,7 +63,7 @@ impl MemPool for InMemPool {
     ) -> Result<FrameWriteGuard, MemPoolStatus> {
         self.exclusive();
         let frames = unsafe { &mut *self.frames.get() };
-        let id_to_index = unsafe { &mut *self.id_to_index.get() };
+        let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
         let container_page_count = unsafe { &mut *self.container_page_count.get() };
 
         let page_id = match container_page_count.entry(c_key) {
@@ -78,26 +77,74 @@ impl MemPool for InMemPool {
                 0
             }
         };
-        let page = Page::new(page_id);
 
         let page_key = PageKey::new(c_key, page_id);
         let frame_index = frames.len();
         let frame = Box::new(BufferFrame::new(frame_index as u32));
         frames.push(frame);
-        id_to_index.insert(page_key, frame_index);
+        page_to_frame.insert(page_key, frame_index);
         let mut guard = (frames.get(frame_index).unwrap()).write(true);
         self.release_exclusive();
 
-        guard.copy(&page);
+        guard.set_id(page_id);
         *guard.page_key_mut() = Some(page_key);
         Ok(guard)
+    }
+
+    fn create_new_pages_for_write(
+        &self,
+        c_key: ContainerKey,
+        num_pages: usize,
+    ) -> Result<Vec<FrameWriteGuard>, MemPoolStatus> {
+        self.exclusive();
+        let frames = unsafe { &mut *self.frames.get() };
+        let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
+        let container_page_count = unsafe { &mut *self.container_page_count.get() };
+
+        let start_page_id = match container_page_count.entry(c_key) {
+            Entry::Occupied(mut entry) => {
+                let page_id = *entry.get();
+                *entry.get_mut() += num_pages as u32;
+                page_id
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(num_pages as u32);
+                0
+            }
+        };
+
+        // Insert all the new pages to the pool
+        for i in 0..num_pages {
+            let page_id = start_page_id + i as u32;
+            let page_key = PageKey::new(c_key, page_id);
+            let frame_index = frames.len();
+            let frame = Box::new(BufferFrame::new(frame_index as u32));
+            frames.push(frame);
+            page_to_frame.insert(page_key, frame_index);
+        }
+
+        let mut guards = Vec::with_capacity(num_pages);
+
+        // Initialize all the new pages
+        for i in 0..num_pages {
+            let page_id = start_page_id + i as u32;
+            let page_key = PageKey::new(c_key, page_id);
+            let frame_index = page_to_frame.get(&page_key).unwrap();
+            let mut guard = (frames.get(*frame_index).unwrap()).write(true);
+            guard.set_id(page_id);
+            *guard.page_key_mut() = Some(page_key);
+            guards.push(guard);
+        }
+
+        self.release_exclusive();
+        Ok(guards)
     }
 
     fn get_page_for_write(&self, key: PageFrameKey) -> Result<FrameWriteGuard, MemPoolStatus> {
         self.shared();
         let frames = unsafe { &*self.frames.get() };
-        let id_to_index = unsafe { &*self.id_to_index.get() };
-        let frame_index = match id_to_index.get(&key.p_key()) {
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        let frame_index = match page_to_frame.get(&key.p_key()) {
             Some(index) => *index,
             None => {
                 self.release_shared();
@@ -117,8 +164,8 @@ impl MemPool for InMemPool {
     fn get_page_for_read(&self, key: PageFrameKey) -> Result<FrameReadGuard, MemPoolStatus> {
         self.shared();
         let frames = unsafe { &*self.frames.get() };
-        let id_to_index = unsafe { &*self.id_to_index.get() };
-        let frame_index = match id_to_index.get(&key.p_key()) {
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        let frame_index = match page_to_frame.get(&key.p_key()) {
             Some(index) => *index,
             None => {
                 self.release_shared();
@@ -139,15 +186,26 @@ impl MemPool for InMemPool {
         Ok(())
     }
 
-    fn stats(&self) -> (usize, usize, usize) {
-        unimplemented!("stats")
-        // "Num pages: ".to_string()
-        //     + &unsafe { &*self.frames.get() }.len().to_string()
-        //     + "\n"
-        //     + "Num containers: "
-        //     + &unsafe { &*self.container_page_count.get() }
-        //         .len()
-        //         .to_string()
+    fn stats(&self) -> MemoryStats {
+        let num_frames = unsafe { &*self.frames.get() }.len();
+        let mut containers = BTreeMap::new();
+        for frame in unsafe { &*self.frames.get() }.iter() {
+            let frame = frame.read();
+            if let Some(key) = frame.page_key() {
+                *containers.entry(key.c_key).or_insert(0) += 1;
+            }
+        }
+        MemoryStats {
+            bp_num_frames_in_mem: num_frames,
+            bp_new_page: num_frames,
+            bp_read_frame: num_frames,
+            bp_read_frame_wait: 0,
+            bp_write_frame: num_frames,
+            bp_num_frames_per_container: containers,
+            disk_read: 0,
+            disk_write: 0,
+            disk_io_per_container: BTreeMap::new(),
+        }
     }
 
     fn reset_stats(&self) {
@@ -180,11 +238,11 @@ impl InMemPool {
         }
     }
 
-    // Invariant: id_to_index contains all pages in frames
-    pub fn check_id_to_index(&self) {
+    // Invariant: page_to_frame contains all pages in frames
+    pub fn check_page_to_frame(&self) {
         let frames = unsafe { &*self.frames.get() };
-        let id_to_index = unsafe { &*self.id_to_index.get() };
-        for (key, index) in id_to_index.iter() {
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        for (key, index) in page_to_frame.iter() {
             let frame = &frames[*index];
             let frame = frame.read();
             assert_eq!(*frame.page_key(), Some(*key));
@@ -240,7 +298,7 @@ mod tests {
         });
 
         mp.check_all_frames_unlatched();
-        mp.check_id_to_index();
+        mp.check_page_to_frame();
         mp.check_frame_id_and_page_id_match();
         let guard = mp.get_page_for_read(page_key).unwrap();
         assert_eq!(guard[0], num_threads * num_iterations);
@@ -263,7 +321,7 @@ mod tests {
         }
 
         mp.check_all_frames_unlatched();
-        mp.check_id_to_index();
+        mp.check_page_to_frame();
         mp.check_frame_id_and_page_id_match();
     }
 
