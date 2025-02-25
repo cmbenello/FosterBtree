@@ -44,7 +44,7 @@ impl<M: MemPool> Storage<M> {
                 ContainerKey::new(db_id, c_id),
                 bp,
             ))),
-            ContainerType::Gensort => Storage::Gensort(Arc::new(GensortStore::<M>::new(
+            ContainerDS::Gensort => Storage::Gensort(Arc::new(GensortStore::<M>::new(
                 ContainerKey::new(db_id, c_id),
                 bp,
             ))),
@@ -66,7 +66,7 @@ impl<M: MemPool> Storage<M> {
                 bp,
                 0,
             ))),
-            ContainerType::Gensort => todo!("xtx")
+            ContainerDS::Gensort => todo!("xtx")
         }
     }
 
@@ -81,7 +81,7 @@ impl<M: MemPool> Storage<M> {
             Storage::Gensort(g) => {
                 // For Gensort, we need to combine key and value into a single record
                 if key.len() != RECORD_KEY_SIZE || val.len() != RECORD_VALUE_SIZE {
-                    return Err(TxnStorageStatus::Error);
+                    return Err(TxnStorageStatus::KeyNotFound);
                 }
                 
                 // Combine key and value into a single record
@@ -603,10 +603,10 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
             Storage::AppendOnly(append_only) => {
                 // Initialize the scanner starting from `start_index` to `end_index`
                 let scanner = append_only.scan_range_from(start_index, end_index)
-                    .map_err(|e| TxnStorageStatus::AccessError(e))?;
+                    .map_err(|e| TxnStorageStatus::KeyNotFound)?;
                 Ok(OnDiskIterator::Vec(Mutex::new(scanner)))
             }
-            Storage::BTreeMap(_) | Storage::HashMap() => {
+            Storage::BTreeMap(_) =>{
                 unimplemented!()
             }
             Storage::Gensort(gensort) => {
@@ -628,7 +628,7 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
             OnDiskIterator::Vec(scanner_mutex) => {
                 let mut scanner = scanner_mutex.lock().unwrap();
                 scanner.seek_to_index(start_index)
-                    .map_err(|e| TxnStorageStatus::AccessError(e))
+                    .map_err(|e| TxnStorageStatus::KeyNotFound)
             }
             OnDiskIterator::GensortRange(_) => Ok(()),
             OnDiskIterator::BTree(_) | OnDiskIterator::Hash() | OnDiskIterator::Gensort(_)=> {

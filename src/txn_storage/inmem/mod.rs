@@ -31,7 +31,7 @@ impl Storage {
             ContainerDS::AppendOnly => {
                 Storage::AppendOnly(RwLatch::default(), UnsafeCell::new(Vec::new()))
             }
-            ContainerType::Gensort => unimplemented!("Gensort only works for ondisk rn")
+            ContainerDS::Gensort => unimplemented!("Gensort only works for ondisk rn")
         }
     }
 

@@ -5,7 +5,6 @@ use crate::bp::MemPoolStatus;
 pub mod append_only_store;
 pub mod sorted_run_store;
 pub mod gensort_store;
-pub mod bloom_chain;
 pub mod chain;
 pub mod fbt;
 pub mod hash_fbt;

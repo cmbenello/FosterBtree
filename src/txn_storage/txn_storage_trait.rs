@@ -85,19 +85,19 @@ pub enum ContainerDS {
 impl ContainerDS {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            ContainerType::Hash => vec![0],
-            ContainerType::BTree => vec![1],
-            ContainerType::AppendOnly => vec![2],
-            ContainerType::Gensort => vec![3],
+            ContainerDS::Hash => vec![0],
+            ContainerDS::BTree => vec![1],
+            ContainerDS::AppendOnly => vec![2],
+            ContainerDS::Gensort => vec![3],
         }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
         match bytes[0] {
-            0 => ContainerType::Hash,
-            1 => ContainerType::BTree,
-            2 => ContainerType::AppendOnly,
-            3 => ContainerType::Gensort,
+            0 => ContainerDS::Hash,
+            1 => ContainerDS::BTree,
+            2 => ContainerDS::AppendOnly,
+            3 => ContainerDS::Gensort,
             _ => panic!("Invalid container type"),
         }
     }

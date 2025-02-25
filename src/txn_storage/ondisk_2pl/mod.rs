@@ -1176,6 +1176,29 @@ impl<M: MemPool> TxnStorageTrait for NoWaitTxnStorage<M> {
         }
     }
 
+    fn scan_range_from(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: &ContainerId,
+        _start_index: usize,
+        _end_index: usize,
+        _options: super::ScanOptions,
+    ) -> Result<Self::IteratorHandle, TxnStorageStatus>{
+        unimplemented!("not done")
+    }
+
+    fn seek(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: &ContainerId,
+        _iter: &Self::IteratorHandle,
+        _start_index: usize,
+    ) -> Result<(), TxnStorageStatus>{
+        unimplemented!("not done")
+    }
+
+
+
     fn iter_next(
         &self,
         txn: &Self::TxnHandle,
@@ -1196,6 +1219,7 @@ impl<M: MemPool> TxnStorageTrait for NoWaitTxnStorage<M> {
     fn drop_iterator_handle(&self, _iter: Self::IteratorHandle) -> Result<(), TxnStorageStatus> {
         unimplemented!()
     }
+    
 }
 
 #[cfg(test)]
