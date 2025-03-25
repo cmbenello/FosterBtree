@@ -4,21 +4,22 @@ use crate::log;
 #[cfg(feature = "iouring_async")]
 use crate::file_manager::iouring_async::GlobalRings;
 
-use crate::{file_manager::FileStats, log_debug, random::gen_random_int, rwlatch::RwLatch};
-
 use super::{
     buffer_frame::{BufferFrame, FrameReadGuard, FrameWriteGuard},
     eviction_policy::EvictionPolicy,
     mem_pool_trait::{ContainerKey, MemPool, MemPoolStatus, MemoryStats, PageFrameKey, PageKey},
 };
-
-use crate::file_manager::{FileManager, FileManagerTrait};
+use crate::{
+    container::ContainerManager,
+    log_debug,
+    page::{self, PageId},
+    random::gen_random_int,
+    rwlatch::RwLatch,
+};
 
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::{BTreeMap, HashMap},
-    fs::create_dir_all,
-    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -26,97 +27,6 @@ use std::{
 };
 
 use concurrent_queue::ConcurrentQueue;
-use dashmap::DashMap;
-
-pub struct ContainerFileManager {
-    base_dir: PathBuf,
-    container_to_file: DashMap<ContainerKey, (Arc<AtomicUsize>, Arc<FileManager>)>,
-    #[cfg(feature = "iouring_async")]
-    ring: Arc<GlobalRings>,
-}
-
-impl ContainerFileManager {
-    pub fn new(base_dir: PathBuf) -> Result<Self, std::io::Error> {
-        // Identify all the directories. A directory corresponds to a database.
-        // A file in the directory corresponds to a container.
-        // Create a FileManager for each file and store it in the container.
-        // If base_dir does not exist, then create it.
-        create_dir_all(&base_dir)?;
-
-        #[cfg(feature = "iouring_async")]
-        let ring = Arc::new(GlobalRings::new(128));
-
-        let container_to_file = DashMap::new();
-        for entry in std::fs::read_dir(&base_dir).unwrap() {
-            let entry = entry.unwrap();
-            let db_path = entry.path();
-            if db_path.is_dir() {
-                let db_id = db_path
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                for entry in std::fs::read_dir(&db_path).unwrap() {
-                    let entry = entry.unwrap();
-                    let file_path = entry.path();
-                    if file_path.is_file() {
-                        let c_id = file_path
-                            .file_name()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        #[cfg(feature = "iouring_async")]
-                        let fm = Arc::new(FileManager::new(&db_path, c_id, ring.clone()).unwrap());
-                        #[cfg(not(feature = "iouring_async"))]
-                        let fm = Arc::new(FileManager::new(&db_path, c_id).unwrap());
-                        let counter = Arc::new(AtomicUsize::new(fm.num_pages()));
-                        container_to_file.insert(ContainerKey { db_id, c_id }, (counter, fm));
-                    }
-                }
-            }
-        }
-
-        Ok(ContainerFileManager {
-            base_dir,
-            container_to_file,
-            #[cfg(feature = "iouring_async")]
-            ring,
-        })
-    }
-
-    pub fn get_file_manager(&self, c_key: ContainerKey) -> (Arc<AtomicUsize>, Arc<FileManager>) {
-        let file = self.container_to_file.entry(c_key).or_insert_with(|| {
-            let db_path = self.base_dir.join(c_key.db_id.to_string());
-            #[cfg(feature = "iouring_async")]
-            let fm = Arc::new(FileManager::new(&db_path, c_key.c_id, self.ring.clone()).unwrap());
-            #[cfg(not(feature = "iouring_async"))]
-            let fm = Arc::new(FileManager::new(&db_path, c_key.c_id).unwrap());
-            let counter = Arc::new(AtomicUsize::new(fm.num_pages()));
-            (counter, fm)
-        });
-        file.value().clone()
-    }
-
-    pub fn get_stats(&self) -> Vec<(ContainerKey, FileStats)> {
-        let mut vec = Vec::new();
-        for fm in self.container_to_file.iter() {
-            let stats = fm.1.get_stats();
-            vec.push((*fm.key(), stats));
-        }
-        vec
-    }
-
-    pub fn flush_all(&self) -> Result<(), MemPoolStatus> {
-        for fm in self.container_to_file.iter() {
-            fm.1.flush()?;
-        }
-        Ok(())
-    }
-}
 
 const EVICTION_SCAN_TRIALS: usize = 5;
 const EVICTION_SCAN_DEPTH: usize = 10;
@@ -293,22 +203,87 @@ impl ThreadLocalEvictionCandidate {
     }
 }
 
+pub struct PageToFrame {
+    map: HashMap<ContainerKey, HashMap<PageId, usize>>, // (c_key, page_id) -> frame_index
+}
+
+impl PageToFrame {
+    pub fn new() -> Self {
+        PageToFrame {
+            map: HashMap::new(),
+        }
+    }
+
+    pub fn contains_key(&self, p_key: &PageKey) -> bool {
+        self.map
+            .get(&p_key.c_key)
+            .map_or(false, |m| m.contains_key(&p_key.page_id))
+    }
+
+    pub fn get(&self, p_key: &PageKey) -> Option<&usize> {
+        // Get by c_key and then page_id
+        self.map
+            .get(&p_key.c_key)
+            .and_then(|m| m.get(&p_key.page_id))
+    }
+
+    pub fn get_page_keys(&self, c_key: ContainerKey) -> Vec<PageFrameKey> {
+        self.map.get(&c_key).map_or(Vec::new(), |m| {
+            m.iter()
+                .map(|(page_id, frame_index)| {
+                    PageFrameKey::new_with_frame_id(c_key, *page_id, *frame_index as u32)
+                })
+                .collect()
+        })
+    }
+
+    pub fn insert(&mut self, p_key: PageKey, frame_id: usize) {
+        self.map
+            .entry(p_key.c_key)
+            .or_insert_with(HashMap::new)
+            .insert(p_key.page_id, frame_id);
+    }
+
+    pub fn remove(&mut self, p_key: &PageKey) -> Option<usize> {
+        self.map
+            .get_mut(&p_key.c_key)
+            .and_then(|m| m.remove(&p_key.page_id))
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ContainerKey, &PageId, &usize)> {
+        self.map.iter().flat_map(|(c_key, page_map)| {
+            page_map
+                .iter()
+                .map(move |(page_id, frame_index)| (c_key, page_id, frame_index))
+        })
+    }
+
+    pub fn iter_container(&self, c_key: ContainerKey) -> impl Iterator<Item = (&PageId, &usize)> {
+        self.map
+            .get(&c_key)
+            .into_iter()
+            .flat_map(|page_map| page_map.iter())
+    }
+}
+
 /// Buffer pool that manages the buffer frames.
 pub struct BufferPool {
-    remove_dir_on_drop: bool,
-    path: PathBuf,
+    container_manager: Arc<ContainerManager>,
     latch: RwLatch,
-    clean_frames_hints: ConcurrentQueue<usize>, // A hint for quickly finding a clean frame. Whenever a clean frame is found, it is pushed to this queue so that it can be quickly found.
+    eviction_hints: ConcurrentQueue<usize>, // A hint for quickly finding a clean frame or a frame to evict. Whenever a clean frame is found, it is pushed to this queue so that it can be quickly found.
     frames: UnsafeCell<Vec<BufferFrame>>, // The Vec<frames> is fixed size. If not fixed size, then Pin must be used to ensure that the frame does not move when the vector is resized.
-    container_file_manager: ContainerFileManager,
-    page_to_frame: UnsafeCell<HashMap<PageKey, usize>>, // (c_key, page_id) -> frame_index
+    page_to_frame: UnsafeCell<PageToFrame>, // (c_key, page_id) -> frame_index
     stats: BPStats,
 }
 
 impl Drop for BufferPool {
     fn drop(&mut self) {
-        if self.remove_dir_on_drop {
-            std::fs::remove_dir_all(&self.path).unwrap();
+        if self.container_manager.remove_dir_on_drop() {
+            // Do nothing. Directory will be removed when the container manager is dropped.
         } else {
             // Persist all the pages to disk
             self.flush_all_and_reset().unwrap();
@@ -318,27 +293,15 @@ impl Drop for BufferPool {
 
 impl BufferPool {
     /// Create a new buffer pool with the given number of frames.
-    /// Directory structure
-    /// * bp_dir
-    ///    * db_dir
-    ///      * container_file
-    ///
-    /// The buffer pool will create the bp_dir if it does not exist.
-    /// The db_dir and container_file are lazily created when a page is evicted and
-    /// a file manager is constructed.
-    /// If remove_dir_on_drop is true, then the bp_dir will be removed when the buffer pool is dropped.
-    pub fn new<P: AsRef<std::path::Path>>(
-        bp_dir: P,
+    pub fn new(
         num_frames: usize,
-        remove_dir_on_drop: bool,
+        container_manager: Arc<ContainerManager>,
     ) -> Result<Self, MemPoolStatus> {
         log_debug!("Buffer pool created: num_frames: {}", num_frames);
 
-        let container_file_manager = ContainerFileManager::new(bp_dir.as_ref().to_path_buf())?;
-
-        let clean_frames_hints = ConcurrentQueue::unbounded();
+        let eviction_hints = ConcurrentQueue::unbounded();
         for i in 0..num_frames {
-            clean_frames_hints.push(i).unwrap();
+            eviction_hints.push(i).unwrap();
         }
 
         let frames = (0..num_frames)
@@ -346,13 +309,11 @@ impl BufferPool {
             .collect();
 
         Ok(BufferPool {
-            remove_dir_on_drop,
-            path: bp_dir.as_ref().to_path_buf(),
+            container_manager,
             latch: RwLatch::default(),
-            page_to_frame: UnsafeCell::new(HashMap::new()),
-            clean_frames_hints,
+            page_to_frame: UnsafeCell::new(PageToFrame::new()),
+            eviction_hints,
             frames: UnsafeCell::new(frames),
-            container_file_manager,
             stats: BPStats::new(),
         })
     }
@@ -386,8 +347,8 @@ impl BufferPool {
     fn choose_victim(&self) -> Option<FrameWriteGuard> {
         let frames = unsafe { &*self.frames.get() };
 
-        // First, try the clean frames hints
-        while let Ok(victim) = self.clean_frames_hints.pop() {
+        // First, try the eviction hints
+        while let Ok(victim) = self.eviction_hints.pop() {
             let frame = frames[victim].try_write(false);
             if let Some(guard) = frame {
                 return Some(guard);
@@ -407,8 +368,8 @@ impl BufferPool {
         let num_victims = frames.len().min(num_victims);
         let mut victims = Vec::with_capacity(num_victims);
 
-        // First, try the clean frames hints
-        while let Ok(victim) = self.clean_frames_hints.pop() {
+        // First, try the eviction hints
+        while let Ok(victim) = self.eviction_hints.pop() {
             let frame = frames[victim].try_write(false);
             if let Some(guard) = frame {
                 victims.push(guard);
@@ -443,9 +404,8 @@ impl BufferPool {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Until this file object is dropped, a lock is held on the shard of the map.
-                let (_, file) = self.container_file_manager.get_file_manager(key.c_key);
-                file.write_page(key.page_id, victim)?;
+                let container = self.container_manager.get_container(key.c_key);
+                container.write_page(key.page_id, victim)?;
             }
         }
 
@@ -465,9 +425,8 @@ impl BufferPool {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Until this file object is dropped, a lock is held on the shard of the map.
-                let (_, file) = self.container_file_manager.get_file_manager(key.c_key);
-                file.write_page(key.page_id, victim)?;
+                let container = self.container_manager.get_container(key.c_key);
+                container.write_page(key.page_id, victim)?;
             }
         }
 
@@ -476,6 +435,22 @@ impl BufferPool {
 }
 
 impl MemPool for BufferPool {
+    fn create_container(&self, c_key: ContainerKey, is_temp: bool) -> Result<(), MemPoolStatus> {
+        self.container_manager.create_container(c_key, is_temp);
+        Ok(())
+    }
+
+    fn drop_container(&self, c_key: ContainerKey) -> Result<(), MemPoolStatus> {
+        self.container_manager.get_container(c_key).set_temp(true);
+        self.shared();
+        let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
+        for (_, frame_index) in page_to_frame.iter_container(c_key) {
+            self.eviction_hints.push(*frame_index).unwrap();
+        }
+        self.release_shared();
+        Ok(())
+    }
+
     /// Create a new page for write in memory.
     /// NOTE: This function does not write the page to disk.
     /// See more at `handle_page_fault(key, new_page=true)`
@@ -499,14 +474,13 @@ impl MemPool for BufferPool {
                     let page_key = {
                         self.exclusive();
                         let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-                        let file_page_counter =
-                            self.container_file_manager.get_file_manager(c_key).0;
                         // Remove the old mapping
                         if let Some(old_key) = victim.page_key() {
                             page_to_frame.remove(old_key).unwrap(); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
                         }
                         // Insert the new mapping
-                        let page_id = file_page_counter.fetch_add(1, Ordering::Relaxed) as u32;
+                        let container = self.container_manager.get_container(c_key);
+                        let page_id = container.inc_page_count(1) as PageId;
                         let index = victim.frame_id();
                         let key = PageKey::new(c_key, page_id);
                         page_to_frame.insert(key, index as usize);
@@ -542,8 +516,7 @@ impl MemPool for BufferPool {
         if !victims.is_empty() {
             // 2. Handle eviction if the page is dirty
             for victim in victims.iter_mut() {
-                let res = self.write_victim_to_disk_if_dirty_w(victim);
-                res?
+                self.write_victim_to_disk_if_dirty_w(victim)?;
             }
 
             let start_page_id = {
@@ -551,7 +524,6 @@ impl MemPool for BufferPool {
                 // Need to remove the old mapping and insert the new mapping.
                 self.exclusive();
                 let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-                let file_page_counter = self.container_file_manager.get_file_manager(c_key).0;
 
                 // Remove the old mapping
                 for victim in victims.iter() {
@@ -561,8 +533,8 @@ impl MemPool for BufferPool {
                 }
 
                 // Insert the new mapping
-                let start_page_id =
-                    file_page_counter.fetch_add(num_pages, Ordering::Relaxed) as u32;
+                let container = self.container_manager.get_container(c_key);
+                let start_page_id = container.inc_page_count(num_pages) as PageId;
                 for (i, victim) in victims.iter_mut().enumerate().take(num_pages) {
                     let page_id = start_page_id + i as u32;
                     let key = PageKey::new(c_key, page_id);
@@ -588,6 +560,38 @@ impl MemPool for BufferPool {
             // Victims not found
             Err(MemPoolStatus::CannotEvictPage)
         }
+    }
+
+    fn is_in_mem(&self, key: PageFrameKey) -> bool {
+        {
+            // Fast path access to the frame using frame_id
+            let frame_id = key.frame_id();
+            let frames = unsafe { &*self.frames.get() };
+            if (frame_id as usize) < frames.len() {
+                if let Some(g) = frames[frame_id as usize].try_read() {
+                    if g.page_key().map(|k| k == key.p_key()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Critical section.
+        {
+            self.shared();
+            let page_to_frame = unsafe { &*self.page_to_frame.get() };
+            let res = page_to_frame.contains_key(&key.p_key());
+            self.release_shared();
+            res
+        }
+    }
+
+    fn get_page_keys_in_mem(&self, c_key: ContainerKey) -> Vec<PageFrameKey> {
+        self.shared();
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        let keys = page_to_frame.get_page_keys(c_key);
+        self.release_shared();
+        keys
     }
 
     fn get_page_for_write(&self, key: PageFrameKey) -> Result<FrameWriteGuard, MemPoolStatus> {
@@ -663,7 +667,7 @@ impl MemPool for BufferPool {
                     let guard = frames[index].try_write(true);
                     self.release_exclusive();
 
-                    self.clean_frames_hints.push(index).unwrap();
+                    self.eviction_hints.push(index).unwrap();
                     drop(victim); // Release the write latch on the unused victim
 
                     guard
@@ -685,15 +689,14 @@ impl MemPool for BufferPool {
                     self.release_exclusive();
 
                     // Read the wanted page from disk.
-                    let file = self
-                        .container_file_manager
-                        .get_file_manager(key.p_key().c_key)
-                        .1;
-                    file.read_page(key.p_key().page_id, &mut victim).map(|()| {
-                        victim.page_key_mut().replace(key.p_key());
-                        victim.evict_info().reset();
-                        victim.evict_info().update();
-                    })?;
+                    let container = self.container_manager.get_container(key.p_key().c_key);
+                    container
+                        .read_page(key.p_key().page_id, &mut victim)
+                        .map(|()| {
+                            victim.page_key_mut().replace(key.p_key());
+                            victim.evict_info().reset();
+                            victim.evict_info().update();
+                        })?;
                     victim.dirty().store(true, Ordering::Release); // Prepare the page for writing.
                     Ok(victim)
                 }
@@ -778,7 +781,7 @@ impl MemPool for BufferPool {
                     let guard = frames[index].try_read();
                     self.release_exclusive();
 
-                    self.clean_frames_hints.push(index).unwrap();
+                    self.eviction_hints.push(index).unwrap();
                     drop(victim); // Release the write latch on the unused victim
 
                     guard
@@ -798,15 +801,14 @@ impl MemPool for BufferPool {
 
                     self.release_exclusive();
 
-                    let file = self
-                        .container_file_manager
-                        .get_file_manager(key.p_key().c_key)
-                        .1;
-                    file.read_page(key.p_key().page_id, &mut victim).map(|()| {
-                        victim.page_key_mut().replace(key.p_key());
-                        victim.evict_info().reset();
-                        victim.evict_info().update();
-                    })?;
+                    let container = self.container_manager.get_container(key.p_key().c_key);
+                    container
+                        .read_page(key.p_key().page_id, &mut victim)
+                        .map(|()| {
+                            victim.page_key_mut().replace(key.p_key());
+                            victim.evict_info().reset();
+                            victim.evict_info().update();
+                        })?;
                     Ok(victim.downgrade())
                 }
             }
@@ -836,7 +838,7 @@ impl MemPool for BufferPool {
         }
 
         // Call fsync on all the files
-        self.container_file_manager.flush_all().inspect_err(|_| {
+        self.container_manager.flush_all().inspect_err(|_| {
             self.release_shared();
         })?;
 
@@ -863,19 +865,20 @@ impl MemPool for BufferPool {
             }
         }
         let mut disk_io_per_container = BTreeMap::new();
-        for (c_key, file_stats) in &self.container_file_manager.get_stats() {
+        for (c_key, (count, file_stats)) in &self.container_manager.get_stats() {
             disk_io_per_container.insert(
                 *c_key,
                 (
+                    *count as i64,
                     file_stats.read_count() as i64,
                     file_stats.write_count() as i64,
                 ),
             );
         }
-        let (total_disk_read, total_disk_write) = disk_io_per_container
+        let (total_created, total_disk_read, total_disk_write) = disk_io_per_container
             .iter()
-            .fold((0, 0), |acc, (_, (read, write))| {
-                (acc.0 + read, acc.1 + write)
+            .fold((0, 0, 0), |acc, (_, (created, read, write))| {
+                (acc.0 + created, acc.1 + read, acc.2 + write)
             });
         MemoryStats {
             bp_num_frames_in_mem: unsafe { &*self.frames.get() }.len(),
@@ -884,6 +887,7 @@ impl MemPool for BufferPool {
             bp_read_frame_wait: read_count_waiting_for_write,
             bp_write_frame: write_count,
             bp_num_frames_per_container: num_frames_per_container,
+            disk_created: total_created as usize,
             disk_read: total_disk_read as usize,
             disk_write: total_disk_write as usize,
             disk_io_per_container,
@@ -919,15 +923,15 @@ impl MemPool for BufferPool {
             frame.clear();
         }
 
-        self.container_file_manager.flush_all().inspect_err(|_| {
+        self.container_manager.flush_all().inspect_err(|_| {
             self.release_exclusive();
         })?;
 
         page_to_frame.clear();
 
-        while self.clean_frames_hints.pop().is_ok() {}
+        while self.eviction_hints.pop().is_ok() {}
         for i in 0..frames.len() {
-            self.clean_frames_hints.push(i).unwrap();
+            self.eviction_hints.push(i).unwrap();
         }
 
         self.release_exclusive();
@@ -950,7 +954,7 @@ impl MemPool for BufferPool {
             frame.dirty().store(false, Ordering::Release);
         }
 
-        self.container_file_manager.flush_all().inspect_err(|_| {
+        self.container_manager.flush_all().inspect_err(|_| {
             self.release_exclusive();
         })?;
 
@@ -980,15 +984,16 @@ impl BufferPool {
     // Invariant: page_to_frame contains all the pages in the buffer pool
     pub fn check_page_to_frame(&self) {
         let page_to_frame = unsafe { &*self.page_to_frame.get() };
-        let mut index_to_id = HashMap::new();
-        for (k, &v) in page_to_frame.iter() {
-            index_to_id.insert(v, k);
+        let mut frame_to_page = HashMap::new();
+        for (c, k, &v) in page_to_frame.iter() {
+            let p_key = PageKey::new(*c, *k);
+            frame_to_page.insert(v, p_key);
         }
         let frames = unsafe { &*self.frames.get() };
         for (i, frame) in frames.iter().enumerate() {
             let frame = frame.read();
-            if index_to_id.contains_key(&i) {
-                assert_eq!(frame.page_key().unwrap(), *index_to_id[&i]);
+            if frame_to_page.contains_key(&i) {
+                assert_eq!(frame.page_key().unwrap(), frame_to_page[&i]);
             } else {
                 assert_eq!(frame.page_key(), &None);
             }
@@ -1006,11 +1011,6 @@ impl BufferPool {
             }
         }
     }
-
-    pub fn is_in_buffer_pool(&self, key: PageFrameKey) -> bool {
-        let page_to_frame = unsafe { &*self.page_to_frame.get() };
-        page_to_frame.contains_key(&key.p_key())
-    }
 }
 
 unsafe impl Sync for BufferPool {}
@@ -1019,7 +1019,7 @@ unsafe impl Sync for BufferPool {}
 mod tests {
     #[allow(unused_imports)]
     use crate::log;
-    use crate::log_info;
+    use crate::{bp::get_test_bp, log_info};
 
     use super::*;
     use std::thread::{self};
@@ -1027,110 +1027,103 @@ mod tests {
 
     #[test]
     fn test_bp_and_frame_latch() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
-        {
-            let num_frames = 10;
-            let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
-            let c_key = ContainerKey::new(db_id, 0);
-            let frame = bp.create_new_page_for_write(c_key).unwrap();
-            let key = frame.page_frame_key().unwrap();
-            drop(frame);
+        let num_frames = 10;
+        let bp = get_test_bp(num_frames);
+        let c_key = ContainerKey::new(db_id, 0);
+        let frame = bp.create_new_page_for_write(c_key).unwrap();
+        let key = frame.page_frame_key().unwrap();
+        drop(frame);
 
-            let num_threads = 3;
-            let num_iterations = 80; // Note: u8 max value is 255
-            thread::scope(|s| {
-                for _ in 0..num_threads {
-                    s.spawn(|| {
-                        for _ in 0..num_iterations {
-                            loop {
-                                if let Ok(mut guard) = bp.get_page_for_write(key) {
-                                    guard[0] += 1;
-                                    break;
-                                } else {
-                                    // spin
-                                    log_info!("Spin");
-                                    std::hint::spin_loop();
-                                }
+        let num_threads = 3;
+        let num_iterations = 80; // Note: u8 max value is 255
+        thread::scope(|s| {
+            for _ in 0..num_threads {
+                s.spawn(|| {
+                    for _ in 0..num_iterations {
+                        loop {
+                            if let Ok(mut guard) = bp.get_page_for_write(key) {
+                                guard[0] += 1;
+                                break;
+                            } else {
+                                // spin
+                                log_info!("Spin");
+                                std::hint::spin_loop();
                             }
                         }
-                    });
-                }
-            });
-            bp.run_checks();
-            {
-                let guard = bp.get_page_for_read(key).unwrap();
-                assert_eq!(guard[0], num_threads * num_iterations);
+                    }
+                });
             }
-            bp.run_checks();
+        });
+        bp.run_checks();
+        {
+            assert!(bp.is_in_mem(key));
+            let guard = bp.get_page_for_read(key).unwrap();
+            assert_eq!(guard[0], num_threads * num_iterations);
         }
+        bp.run_checks();
     }
 
     #[test]
     fn test_bp_write_back_simple() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
-        {
-            let num_frames = 1;
-            let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
-            let c_key = ContainerKey::new(db_id, 0);
+        let num_frames = 1;
+        let bp = get_test_bp(num_frames);
+        let c_key = ContainerKey::new(db_id, 0);
 
-            let key1 = {
-                let mut guard = bp.create_new_page_for_write(c_key).unwrap();
-                guard[0] = 1;
-                guard.page_frame_key().unwrap()
-            };
-            let key2 = {
-                let mut guard = bp.create_new_page_for_write(c_key).unwrap();
-                guard[0] = 2;
-                guard.page_frame_key().unwrap()
-            };
-            bp.run_checks();
-            // check contents of evicted page
-            {
-                let guard = bp.get_page_for_read(key1).unwrap();
-                assert_eq!(guard[0], 1);
-            }
-            // check contents of the page in the buffer pool
-            {
-                let guard = bp.get_page_for_read(key2).unwrap();
-                assert_eq!(guard[0], 2);
-            }
-            bp.run_checks();
+        let key1 = {
+            let mut guard = bp.create_new_page_for_write(c_key).unwrap();
+            guard[0] = 1;
+            guard.page_frame_key().unwrap()
+        };
+        let key2 = {
+            let mut guard = bp.create_new_page_for_write(c_key).unwrap();
+            guard[0] = 2;
+            guard.page_frame_key().unwrap()
+        };
+        bp.run_checks();
+        // check contents of evicted page
+        {
+            assert!(!bp.is_in_mem(key1));
+            let guard = bp.get_page_for_read(key1).unwrap();
+            assert_eq!(guard[0], 1);
         }
+        // check contents of the second page
+        {
+            assert!(!bp.is_in_mem(key2));
+            let guard = bp.get_page_for_read(key2).unwrap();
+            assert_eq!(guard[0], 2);
+        }
+        bp.run_checks();
     }
 
     #[test]
     fn test_bp_write_back_many() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
-        {
-            let mut keys = Vec::new();
-            let num_frames = 1;
-            let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
-            let c_key = ContainerKey::new(db_id, 0);
+        let mut keys = Vec::new();
+        let num_frames = 1;
+        let bp = get_test_bp(num_frames);
+        let c_key = ContainerKey::new(db_id, 0);
 
-            for i in 0..100 {
-                let mut guard = bp.create_new_page_for_write(c_key).unwrap();
-                guard[0] = i;
-                keys.push(guard.page_frame_key().unwrap());
-            }
-            bp.run_checks();
-            for (i, key) in keys.iter().enumerate() {
-                let guard = bp.get_page_for_read(*key).unwrap();
-                assert_eq!(guard[0], i as u8);
-            }
-            bp.run_checks();
+        for i in 0..100 {
+            let mut guard = bp.create_new_page_for_write(c_key).unwrap();
+            guard[0] = i;
+            keys.push(guard.page_frame_key().unwrap());
         }
+        bp.run_checks();
+        for (i, key) in keys.iter().enumerate() {
+            let guard = bp.get_page_for_read(*key).unwrap();
+            assert_eq!(guard[0], i as u8);
+        }
+        bp.run_checks();
     }
 
     #[test]
     fn test_bp_create_new_page() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
 
         let num_frames = 2;
-        let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
+        let bp = get_test_bp(num_frames);
         let c_key = ContainerKey::new(db_id, 0);
 
         let num_traversal = 100;
@@ -1165,11 +1158,10 @@ mod tests {
 
     #[test]
     fn test_bp_all_frames_latched() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
 
         let num_frames = 1;
-        let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
+        let bp = get_test_bp(num_frames);
         let c_key = ContainerKey::new(db_id, 0);
 
         let mut guard1 = bp.create_new_page_for_write(c_key).unwrap();
@@ -1188,11 +1180,10 @@ mod tests {
 
     #[test]
     fn test_bp_clear_frames() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
 
         let num_frames = 10;
-        let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
+        let bp = get_test_bp(num_frames);
         let c_key = ContainerKey::new(db_id, 0);
 
         let mut keys = Vec::new();
@@ -1222,48 +1213,48 @@ mod tests {
     fn test_bp_clear_frames_durable() {
         let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
-
         let num_frames = 10;
-        let bp1 = BufferPool::new(&temp_dir, num_frames, false).unwrap();
-        let c_key = ContainerKey::new(db_id, 0);
-
         let mut keys = Vec::new();
-        for i in 0..num_frames * 10 {
-            let mut guard = bp1.create_new_page_for_write(c_key).unwrap();
-            guard[0] = i as u8;
-            keys.push(guard.page_frame_key().unwrap());
+
+        {
+            let cm = Arc::new(ContainerManager::new(&temp_dir, false, false).unwrap());
+            let bp1 = BufferPool::new(num_frames, cm).unwrap();
+            let c_key = ContainerKey::new(db_id, 0);
+
+            for i in 0..num_frames * 10 {
+                let mut guard = bp1.create_new_page_for_write(c_key).unwrap();
+                guard[0] = i as u8;
+                keys.push(guard.page_frame_key().unwrap());
+            }
+
+            bp1.run_checks();
+
+            // Clear the buffer pool
+            bp1.flush_all_and_reset().unwrap();
+
+            bp1.run_checks();
         }
 
-        bp1.run_checks();
+        {
+            let cm = Arc::new(ContainerManager::new(&temp_dir, false, false).unwrap());
+            let bp2 = BufferPool::new(num_frames, cm).unwrap();
 
-        // Clear the buffer pool
-        bp1.flush_all_and_reset().unwrap();
+            // Check the contents of the pages
+            for (i, key) in keys.iter().enumerate() {
+                let guard = bp2.get_page_for_read(*key).unwrap();
+                assert_eq!(guard[0], i as u8);
+            }
 
-        bp1.run_checks();
-
-        drop(bp1); // Drop will also clear the buffer pool
-
-        // Create a new buffer pool
-        let bp2 = BufferPool::new(&temp_dir, num_frames * 2, false).unwrap();
-
-        bp2.run_checks();
-
-        // Check the contents of the pages
-        for (i, key) in keys.iter().enumerate() {
-            let guard = bp2.get_page_for_read(*key).unwrap();
-            assert_eq!(guard[0], i as u8);
+            bp2.run_checks();
         }
-
-        bp2.run_checks();
     }
 
     #[test]
     fn test_bp_stats() {
-        let temp_dir = TempDir::new().unwrap();
         let db_id = 0;
 
         let num_frames = 1;
-        let bp = BufferPool::new(&temp_dir, num_frames, false).unwrap();
+        let bp = get_test_bp(num_frames);
         let c_key = ContainerKey::new(db_id, 0);
 
         let key_1 = {
