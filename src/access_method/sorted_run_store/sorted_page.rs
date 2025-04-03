@@ -22,17 +22,14 @@ mod slot {
     impl Slot {
         pub fn from_bytes(bytes: &[u8; SLOT_SIZE]) -> Self {
             let mut current_pos = 0;
-            let offset = u32::from_be_bytes(
-                bytes[current_pos..current_pos + 4].try_into().unwrap(),
-            );
+            let offset =
+                u32::from_be_bytes(bytes[current_pos..current_pos + 4].try_into().unwrap());
             current_pos += 4;
-            let key_size = u32::from_be_bytes(
-                bytes[current_pos..current_pos + 4].try_into().unwrap(),
-            );
+            let key_size =
+                u32::from_be_bytes(bytes[current_pos..current_pos + 4].try_into().unwrap());
             current_pos += 4;
-            let val_size = u32::from_be_bytes(
-                bytes[current_pos..current_pos + 4].try_into().unwrap(),
-            );
+            let val_size =
+                u32::from_be_bytes(bytes[current_pos..current_pos + 4].try_into().unwrap());
 
             Slot {
                 offset,
@@ -44,14 +41,11 @@ mod slot {
         pub fn to_bytes(&self) -> [u8; SLOT_SIZE] {
             let mut bytes = [0; SLOT_SIZE];
             let mut current_pos = 0;
-            bytes[current_pos..current_pos + 4]
-                .copy_from_slice(&self.offset.to_be_bytes());
+            bytes[current_pos..current_pos + 4].copy_from_slice(&self.offset.to_be_bytes());
             current_pos += 4;
-            bytes[current_pos..current_pos + 4]
-                .copy_from_slice(&self.key_size.to_be_bytes());
+            bytes[current_pos..current_pos + 4].copy_from_slice(&self.key_size.to_be_bytes());
             current_pos += 4;
-            bytes[current_pos..current_pos + 4]
-                .copy_from_slice(&self.val_size.to_be_bytes());
+            bytes[current_pos..current_pos + 4].copy_from_slice(&self.val_size.to_be_bytes());
             bytes
         }
 
@@ -117,6 +111,12 @@ pub trait SortedPage {
 
     /// Get the record at the given slot index.
     fn get(&self, slot_id: u32) -> (&[u8], &[u8]);
+
+    /// Get the mutable val at the slot_id.
+    /// If the slot_id is invalid, panic.
+    /// This function is used for updating the val in place.
+    /// Updates of the record should not change the size of the val.
+    fn get_mut_val(&mut self, slot_id: u32) -> &mut [u8];
 
     /// Search for a key using binary search within the page.
     /// Returns `Ok(slot_id)` if found, `Err(insert_pos)` if not.
@@ -216,10 +216,7 @@ impl SortedPage for Page {
         if self.total_free_space() < SLOT_SIZE as u32 + total_len as u32 {
             false
         } else {
-            let insert_pos = match self.search_key(key) {
-                Ok(pos) => pos,    // Key already exists
-                Err(pos) => pos,    // Position to insert
-            };
+            let insert_pos = self.slot_count();
 
             let rec_start_offset = self.rec_start_offset() - total_len as u32;
             self[rec_start_offset as usize..rec_start_offset as usize + key.len()]
@@ -245,6 +242,13 @@ impl SortedPage for Page {
         let value = &self[offset + slot.key_size() as usize
             ..offset + slot.key_size() as usize + slot.val_size() as usize];
         (key, value)
+    }
+
+    fn get_mut_val(&mut self, slot_id: u32) -> &mut [u8] {
+        let slot = self.slot(slot_id).unwrap();
+        let offset = slot.offset() as usize;
+        &mut self[offset + slot.key_size() as usize
+            ..offset + slot.key_size() as usize + slot.val_size() as usize]
     }
 
     fn search_key(&self, key: &[u8]) -> Result<u32, u32> {

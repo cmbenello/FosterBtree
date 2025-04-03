@@ -1,11 +1,17 @@
 use std::{
-    cell::UnsafeCell, collections::HashSet, mem::uninitialized, sync::{Arc, Mutex, RwLock}
+    cell::UnsafeCell,
+    collections::HashSet,
+    mem::uninitialized,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crate::access_method::{
     gensort_store::{
-        GensortStore, RECORD_KEY_SIZE, RECORD_VALUE_SIZE, RECORD_SIZE, GensortStoreScan, RangeScanner}, 
-        AccessMethodError};
+        GensortStore, GensortStoreScan, RangeScanner, RECORD_KEY_SIZE, RECORD_SIZE,
+        RECORD_VALUE_SIZE,
+    },
+    AccessMethodError,
+};
 
 use super::{
     ContainerDS, ContainerOptions, DBOptions, ScanOptions, TxnOptions, TxnStorageStatus,
@@ -66,7 +72,7 @@ impl<M: MemPool> Storage<M> {
                 bp,
                 0,
             ))),
-            ContainerDS::Gensort => todo!("xtx")
+            ContainerDS::Gensort => todo!("xtx"),
         }
     }
 
@@ -83,12 +89,12 @@ impl<M: MemPool> Storage<M> {
                 if key.len() != RECORD_KEY_SIZE || val.len() != RECORD_VALUE_SIZE {
                     return Err(TxnStorageStatus::KeyNotFound);
                 }
-                
+
                 // Combine key and value into a single record
                 let mut record = Vec::with_capacity(RECORD_SIZE);
                 record.extend_from_slice(&key);
                 record.extend_from_slice(&val);
-                
+
                 g.append(&record);
             }
         };
@@ -602,11 +608,12 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
         match storage {
             Storage::AppendOnly(append_only) => {
                 // Initialize the scanner starting from `start_index` to `end_index`
-                let scanner = append_only.scan_range_from(start_index, end_index)
+                let scanner = append_only
+                    .scan_range_from(start_index, end_index)
                     .map_err(|e| TxnStorageStatus::KeyNotFound)?;
                 Ok(OnDiskIterator::Vec(Mutex::new(scanner)))
             }
-            Storage::BTreeMap(_) =>{
+            Storage::BTreeMap(_) => {
                 unimplemented!()
             }
             Storage::Gensort(gensort) => {
@@ -627,11 +634,12 @@ impl<M: MemPool> TxnStorageTrait for OnDiskStorage<M> {
         match iter {
             OnDiskIterator::Vec(scanner_mutex) => {
                 let mut scanner = scanner_mutex.lock().unwrap();
-                scanner.seek_to_index(start_index)
+                scanner
+                    .seek_to_index(start_index)
                     .map_err(|e| TxnStorageStatus::KeyNotFound)
             }
             OnDiskIterator::GensortRange(_) => Ok(()),
-            OnDiskIterator::BTree(_) | OnDiskIterator::Hash() | OnDiskIterator::Gensort(_)=> {
+            OnDiskIterator::BTree(_) | OnDiskIterator::Hash() | OnDiskIterator::Gensort(_) => {
                 unimplemented!()
             }
         }

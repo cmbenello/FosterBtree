@@ -80,7 +80,6 @@ pub struct AppendOnlyStore<T: MemPool> {
 
     // Tracking page indexes useful for reading ahead xtx do i need to keep track of frames?
     pages: RwLock<Vec<(PageId, u32, u32)>>, // (page_id, frame_id, slot_count)
-
 }
 
 impl<T: MemPool> AppendOnlyStore<T> {
@@ -116,7 +115,11 @@ impl<T: MemPool> AppendOnlyStore<T> {
         assert!(root_page.append(&[], &data_key_bytes));
 
         // Initialize the pages index with the first data page
-        let pages = RwLock::new(vec![(data_page.get_id(), data_page.frame_id(), data_page.slot_count())]);
+        let pages = RwLock::new(vec![(
+            data_page.get_id(),
+            data_page.frame_id(),
+            data_page.slot_count(),
+        )]);
 
         AppendOnlyStore {
             c_key,
@@ -325,17 +328,16 @@ impl<T: MemPool> AppendOnlyStore<T> {
         AppendOnlyStoreRangeIter::new(Arc::new(self.clone()), start, end)
     }
 
-        /// Initiates a scan starting from `start_index` up to `end_index`.
-        pub fn scan_range_from(
-            &self,
-            start_index: usize,
-            end_index: usize,
-        ) -> Result<AppendOnlyStoreScanner<T>, AccessMethodError> {
-            AppendOnlyStoreScanner::new(Arc::new(self.clone()), start_index, end_index)
-        }
+    /// Initiates a scan starting from `start_index` up to `end_index`.
+    pub fn scan_range_from(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<AppendOnlyStoreScanner<T>, AccessMethodError> {
+        AppendOnlyStoreScanner::new(Arc::new(self.clone()), start_index, end_index)
+    }
 
     // XTX num_tuples
-
 }
 
 impl<T: MemPool> Clone for AppendOnlyStore<T> {
@@ -468,7 +470,6 @@ impl<T: MemPool> AppendOnlyStoreScanner<T> {
             self.next_record()
         }
     }
-        
 }
 
 impl<T: MemPool> Iterator for AppendOnlyStoreScanner<T> {
@@ -534,7 +535,6 @@ impl<T: MemPool> Iterator for AppendOnlyStoreScanner<T> {
     }
 }
 
-
 pub struct AppendOnlyStoreRangeIter<M: MemPool> {
     store: Arc<AppendOnlyStore<M>>,
     start_index: usize,
@@ -542,7 +542,6 @@ pub struct AppendOnlyStoreRangeIter<M: MemPool> {
     current_index: usize,
 }
 // XTX should i use usize or u32
-
 
 impl<M: MemPool> AppendOnlyStoreRangeIter<M> {
     pub fn new(store: Arc<AppendOnlyStore<M>>, start: usize, end: usize) -> Self {

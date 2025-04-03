@@ -31,7 +31,7 @@ impl Storage {
             ContainerDS::AppendOnly => {
                 Storage::AppendOnly(RwLatch::default(), UnsafeCell::new(Vec::new()))
             }
-            ContainerDS::Gensort => unimplemented!("Gensort only works for ondisk rn")
+            ContainerDS::Gensort => unimplemented!("Gensort only works for ondisk rn"),
         }
     }
 
@@ -637,26 +637,26 @@ impl TxnStorageTrait for InMemStorage {
         Ok(())
     }
 
-        // Implement scan_range_from
-        fn scan_range_from(
-            &self,
-            _txn: &Self::TxnHandle,
-            _c_id: &ContainerId,
-            _start_index: usize,
-            _end_index: usize,
-            _options: ScanOptions,
-        ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
-            unimplemented!()
-        }
-    
-        // Implement seek
-        fn seek(
-            &self,
-            _txn: &Self::TxnHandle,
-            _c_id: &ContainerId,
-            _iter: &Self::IteratorHandle,
-            _start_index: usize,
-        ) -> Result<(), TxnStorageStatus> {
-            unimplemented!()
-        }
+    // Implement scan_range_from
+    fn scan_range_from(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: &ContainerId,
+        _start_index: usize,
+        _end_index: usize,
+        _options: ScanOptions,
+    ) -> Result<Self::IteratorHandle, TxnStorageStatus> {
+        unimplemented!()
+    }
+
+    // Implement seek
+    fn seek(
+        &self,
+        _txn: &Self::TxnHandle,
+        _c_id: &ContainerId,
+        _iter: &Self::IteratorHandle,
+        _start_index: usize,
+    ) -> Result<(), TxnStorageStatus> {
+        unimplemented!()
+    }
 }

@@ -1,19 +1,18 @@
-use crate::prelude::{Page, PageId, AVAILABLE_PAGE_SIZE};
 use crate::access_method::gensort_store::{RECORD_KEY_SIZE, RECORD_SIZE, RECORD_VALUE_SIZE};
+use crate::prelude::{Page, PageId, AVAILABLE_PAGE_SIZE};
 
 // Constants for the gensort format
 
-
 // Page header only needs minimal information
-pub const PAGE_HEADER_SIZE: usize = 8;  // next_page (4 bytes) + record_count (4 bytes)
-// xtx I think can update this so that it alligns with the page
+pub const PAGE_HEADER_SIZE: usize = 8; // next_page (4 bytes) + record_count (4 bytes)
+                                       // xtx I think can update this so that it alligns with the page
 
 pub trait GensortPage {
     fn init_gensort(&mut self);
     fn max_records_per_page() -> usize {
         (AVAILABLE_PAGE_SIZE - PAGE_HEADER_SIZE) / RECORD_SIZE
     }
-    
+
     // Header operations
     fn next_page(&self) -> Option<PageId>;
     fn set_next_page(&mut self, next_page_id: PageId);
@@ -29,11 +28,11 @@ pub trait GensortPage {
         let used_space = PAGE_HEADER_SIZE + (self.record_count() as usize * RECORD_SIZE);
         used_space + RECORD_SIZE <= AVAILABLE_PAGE_SIZE
     }
-    
+
     fn get_record_offset(&self, idx: u32) -> usize {
         PAGE_HEADER_SIZE + (idx as usize * RECORD_SIZE)
     }
-    
+
     fn append_record(&mut self, record: &[u8]) -> bool;
     fn get_record(&self, idx: u32) -> Option<&[u8]>;
     fn get_key(&self, idx: u32) -> Option<&[u8]>;
@@ -124,7 +123,7 @@ mod tests {
 
         let record = vec![42; RECORD_SIZE];
         assert!(page.append_record(&record));
-        
+
         assert_eq!(page.record_count(), 1);
         assert_eq!(page.get_record(0), Some(&record[..]));
     }
@@ -133,14 +132,14 @@ mod tests {
     fn test_record_capacity() {
         let mut page = Page::new_empty();
         page.init_gensort();
-        
+
         let max_records = <Page as GensortPage>::max_records_per_page();
         let record = vec![42; RECORD_SIZE];
 
         for _ in 0..max_records {
             assert!(page.append_record(&record));
         }
-        
+
         // Should not be able to add one more record
         assert!(!page.append_record(&record));
     }
