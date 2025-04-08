@@ -152,9 +152,10 @@ pub struct MemoryStats {
     pub bp_num_frames_per_container: BTreeMap<ContainerKey, i64>, // Number of pages of each container in BP
 
     // Disk stats
-    pub disk_read: usize,  // Total number of pages read (DISK)
-    pub disk_write: usize, // Total number of pages written (DISK)
-    pub disk_io_per_container: BTreeMap<ContainerKey, (i64, i64)>, // Number of pages read and written for each container
+    pub disk_created: usize, // Total number of pages created (DISK)
+    pub disk_read: usize,    // Total number of pages read (DISK)
+    pub disk_write: usize,   // Total number of pages written (DISK)
+    pub disk_io_per_container: BTreeMap<ContainerKey, (i64, i64, i64)>, // Number of pages created, read, and written for each container
 }
 
 impl Default for MemoryStats {
@@ -172,6 +173,7 @@ impl MemoryStats {
             bp_read_frame_wait: 0,
             bp_write_frame: 0,
             bp_num_frames_per_container: BTreeMap::new(),
+            disk_created: 0,
             disk_read: 0,
             disk_write: 0,
             disk_io_per_container: BTreeMap::new(),
@@ -194,14 +196,15 @@ impl MemoryStats {
                     (*k, v - prev)
                 })
                 .collect(),
+            disk_created: self.disk_created - previous.disk_created,
             disk_read: self.disk_read - previous.disk_read,
             disk_write: self.disk_write - previous.disk_write,
             disk_io_per_container: self
                 .disk_io_per_container
                 .iter()
                 .map(|(k, v)| {
-                    let prev = previous.disk_io_per_container.get(k).unwrap_or(&(0, 0));
-                    (*k, (v.0 - prev.0, v.1 - prev.1))
+                    let prev = previous.disk_io_per_container.get(k).unwrap_or(&(0, 0, 0));
+                    (*k, (v.0 - prev.0, v.1 - prev.1, v.2 - prev.2))
                 })
                 .collect(),
         }
@@ -237,17 +240,42 @@ impl std::fmt::Display for MemoryStats {
             writeln!(f, "    {}: {}", c_key, num_pages)?;
         }
         writeln!(f, "Disk stats:")?;
+        writeln!(f, "  Number of pages created: {}", self.disk_created)?;
         writeln!(f, "  Number of pages read: {}", self.disk_read)?;
         writeln!(f, "  Number of pages written: {}", self.disk_write)?;
         writeln!(f, "  Number of pages read and written for each container:")?;
-        for (c_key, (num_read, num_write)) in &self.disk_io_per_container {
-            writeln!(f, "    {}: read={}, write={}", c_key, num_read, num_write)?;
+        for (c_key, (num_created, num_read, num_write)) in &self.disk_io_per_container {
+            writeln!(
+                f,
+                "    {}: created={}, read={}, written={}",
+                c_key, num_created, num_read, num_write
+            )?;
         }
         Ok(())
     }
 }
 
 pub trait MemPool: Sync + Send {
+    /// Create a container.
+    /// A container is basically a file in the file system if a disk-based storage is used.
+    /// If an in-memory storage is used, a container is a logical separation of pages.
+    /// This function will register a container in the memory pool.
+    /// If a page write is requested to a unregistered container, a container will be lazily created
+    /// and the page will be written to the container file.
+    /// Therefore, calling this function is not mandatory unless you want to ensure that
+    /// the container is created or you want to create a temporary container.
+    /// Creation of a already created container will be ignored.
+    fn create_container(&self, c_key: ContainerKey, is_temp: bool) -> Result<(), MemPoolStatus>;
+
+    /// Drop a container.
+    /// This only makes the container temporary, that is, it ensures that future write
+    /// requests to the container will be ignored. This does not guarantee that the pages
+    /// of the container are deleted from the disk or memory.
+    /// However, the page eviction policy could use this information to guide
+    /// the eviction of the pages in the memory pool as evicting pages of a temporary container
+    /// is virtually free.
+    fn drop_container(&self, c_key: ContainerKey) -> Result<(), MemPoolStatus>;
+
     /// Create a new page for write.
     /// This function will allocate a new page in memory and return a FrameWriteGuard.
     /// In general, this function does not need to write the page to disk.
@@ -274,6 +302,17 @@ pub trait MemPool: Sync + Send {
         c_key: ContainerKey,
         num_pages: usize,
     ) -> Result<Vec<FrameWriteGuard>, MemPoolStatus>;
+
+    /// Check if a page is cached in the memory pool.
+    /// This function will return true if the page is in memory, false otherwise.
+    /// There are no side effects of calling this function.
+    /// That is, the page will not be loaded into memory.
+    fn is_in_mem(&self, key: PageFrameKey) -> bool;
+
+    /// Get the list of page frame keys for a container.
+    /// This function will return a list of page frame keys for the container
+    /// that are currently in the memory pool.
+    fn get_page_keys_in_mem(&self, c_key: ContainerKey) -> Vec<PageFrameKey>;
 
     /// Get a page for write.
     /// This function will return a FrameWriteGuard.

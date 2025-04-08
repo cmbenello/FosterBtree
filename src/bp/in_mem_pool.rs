@@ -57,6 +57,14 @@ impl InMemPool {
 }
 
 impl MemPool for InMemPool {
+    fn create_container(&self, _c_key: ContainerKey, _is_temp: bool) -> Result<(), MemPoolStatus> {
+        Ok(())
+    }
+
+    fn drop_container(&self, _c_key: ContainerKey) -> Result<(), MemPoolStatus> {
+        Ok(())
+    }
+
     fn create_new_page_for_write(
         &self,
         c_key: ContainerKey,
@@ -140,6 +148,28 @@ impl MemPool for InMemPool {
         Ok(guards)
     }
 
+    fn is_in_mem(&self, key: PageFrameKey) -> bool {
+        self.shared();
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        let is_cached = page_to_frame.contains_key(&key.p_key());
+        self.release_shared();
+        is_cached
+    }
+
+    fn get_page_keys_in_mem(&self, c_key: ContainerKey) -> Vec<PageFrameKey> {
+        self.shared();
+        let page_to_frame = unsafe { &*self.page_to_frame.get() };
+        let keys = page_to_frame
+            .iter()
+            .filter(|(key, _)| key.c_key == c_key)
+            .map(|(key, frame_idx)| {
+                PageFrameKey::new_with_frame_id(c_key, key.page_id, *frame_idx as u32)
+            })
+            .collect();
+        self.release_shared();
+        keys
+    }
+
     fn get_page_for_write(&self, key: PageFrameKey) -> Result<FrameWriteGuard, MemPoolStatus> {
         self.shared();
         let frames = unsafe { &*self.frames.get() };
@@ -202,6 +232,7 @@ impl MemPool for InMemPool {
             bp_read_frame_wait: 0,
             bp_write_frame: num_frames,
             bp_num_frames_per_container: containers,
+            disk_created: 0,
             disk_read: 0,
             disk_write: 0,
             disk_io_per_container: BTreeMap::new(),
