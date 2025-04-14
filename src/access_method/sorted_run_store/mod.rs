@@ -40,12 +40,12 @@ use std::time::Duration;
 /// It allows for storing sorted key-value pairs across multiple pages and provides
 /// methods to scan over the sorted data, including range scans.
 pub struct SortedRunStore<T: MemPool> {
-    c_key: ContainerKey, // Container key identifying the storage container
-    mem_pool: Arc<T>,    // Shared memory pool for page management
+    pub c_key: ContainerKey, // Container key identifying the storage container
+    pub mem_pool: Arc<T>,    // Shared memory pool for page management
     // page_ids: Vec<PageId>,    // List of page IDs that make up the sorted run xtx replace with num tuples in each page
-    total_len: usize, // List of page IDs that make up the sorted run xtx replace with num tuples in each page
-    min_keys: Vec<Vec<u8>>, // Stores the minimum key of each page for efficient lookup
-    page_ids: Vec<PageFrameKey>,
+    pub total_len: usize, // List of page IDs that make up the sorted run xtx replace with num tuples in each page
+    pub min_keys: Vec<Vec<u8>>, // Stores the minimum key of each page for efficient lookup
+    pub page_ids: Vec<PageFrameKey>,
 }
 
 impl<T: MemPool> SortedRunStore<T> {
@@ -143,49 +143,97 @@ impl<T: MemPool> SortedRunStore<T> {
         mem_pool: Arc<T>,
         iter: impl Iterator<Item = (K, V)>,
     ) -> Self {
+        // Initialize structures to track pages and keys
         let mut page_ids = Vec::new();
         let mut min_keys = Vec::new();
         let mut total_len = 0;
+        
+        // Constants for batch allocation
+        const BATCH_SIZE: usize = 16; // Adjust based on your workload characteristics
+        let mut batch_buffer: Vec<FrameWriteGuard> = Vec::with_capacity(BATCH_SIZE);
+        let mut current_page_idx = 0;
+        
+        // Pre-allocate batch of pages - will be used as needed
+        if let Ok(pages) = mem_pool.create_new_pages_for_write(c_key, BATCH_SIZE) {
+            for mut page in pages {
+                page.init();
+                let page_frame_key = {
+                    let page_id = page.get_id();
+                    let frame_id = page.frame_id();
+                    PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
+                };
+                page_ids.push(page_frame_key);
+                batch_buffer.push(page);
+            }
+        } else {
+            // Fallback to single page allocation if batch allocation fails
+            let mut page = mem_pool.create_new_page_for_write(c_key).unwrap();
+            page.init();
+            let page_frame_key = {
+                let page_id = page.get_id();
+                let frame_id = page.frame_id();
+                PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
+            };
+            page_ids.push(page_frame_key);
+            batch_buffer.push(page);
+        }
 
-        let mut data_page = mem_pool.create_new_page_for_write(c_key).unwrap();
-        data_page.init();
-        let data_key = {
-            let page_id = data_page.get_id();
-            let frame_id = data_page.frame_id();
-            PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
-        };
-        page_ids.push(data_key);
-
+        // Process iterator of key-value pairs
         for (k, v) in iter {
             total_len += 1;
+            let key_ref = k.as_ref();
+            let value_ref = v.as_ref();
 
-            if data_page.append(k.as_ref(), v.as_ref()) {
-                // Do nothing
+            // Try to append to the current page
+            if current_page_idx < batch_buffer.len() && batch_buffer[current_page_idx].append(key_ref, value_ref) {
+                // If this is the first key in the page, store it as the min key
+                if batch_buffer[current_page_idx].slot_count() == 1 {
+                    min_keys.push(key_ref.to_vec());
+                }
             } else {
-                drop(data_page);
-                // Go to the next page.
-                let mut new_page = mem_pool.create_new_page_for_write(c_key).unwrap();
-                new_page.init();
+                // Current page is full or we've used all pre-allocated pages, get a new page
+                current_page_idx += 1;
+                
+                // If we've used all pages in our batch, allocate more
+                if current_page_idx >= batch_buffer.len() {
+                    // Drop current batch to release resources
+                    batch_buffer.clear();
+                    
+                    // Allocate a new batch
+                    if let Ok(pages) = mem_pool.create_new_pages_for_write(c_key, BATCH_SIZE) {
+                        for mut page in pages {
+                            page.init();
+                            let page_frame_key = {
+                                let page_id = page.get_id();
+                                let frame_id = page.frame_id();
+                                PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
+                            };
+                            page_ids.push(page_frame_key);
+                            batch_buffer.push(page);
+                        }
+                    } else {
+                        // Fallback to single page allocation
+                        let mut page = mem_pool.create_new_page_for_write(c_key).unwrap();
+                        page.init();
+                        let page_frame_key = {
+                            let page_id = page.get_id();
+                            let frame_id = page.frame_id();
+                            PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
+                        };
+                        page_ids.push(page_frame_key);
+                        batch_buffer.push(page);
+                    }
+                    current_page_idx = 0;
+                }
 
-                let page_id = new_page.get_id();
-                let frame_id = new_page.frame_id();
-
-                // self.stats.inc_num_pages();
-
-                // Update the in-memory last key to the new page
-                let new_key = PageFrameKey::new_with_frame_id(c_key, page_id, frame_id);
-                page_ids.push(new_key);
-
-                // Append the key-value pair to the new page
-                assert!(new_page.append(k.as_ref(), v.as_ref()));
-                data_page = new_page;
-            }
-
-            if data_page.slot_count() == 1 {
-                min_keys.push(k.as_ref().to_vec());
+                // Append to the new page (should succeed)
+                assert!(batch_buffer[current_page_idx].append(key_ref, value_ref));
+                min_keys.push(key_ref.to_vec());
             }
         }
-        drop(data_page);
+
+        // Cleanup - release all pages in the batch buffer
+        drop(batch_buffer);
 
         Self {
             c_key,
@@ -194,46 +242,92 @@ impl<T: MemPool> SortedRunStore<T> {
             page_ids,
             min_keys,
         }
+    }
 
-        /*
-        let mut storage = Self::create(c_key, mem_pool);
-        for (k, v) in iter {
-            self.total_len += 1;
-            let last_key = self.page_ids.last().cloned().unwrap();
-            let mut last_page = self.write_page(&last_key);
-
-            // Try to append to the last page
-            if last_page.append(key, value) {
-                if last_page.slot_count() == 1 {
-                    drop(last_page);
-                    self.min_keys.push(key.to_vec());
+    /// Batch appends multiple key-value pairs to the store.
+    /// This can be significantly more efficient for bulk operations.
+    pub fn batch_append<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        kvs: &[(K, V)]
+    ) -> Result<(), AccessMethodError> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        
+        // Get the last page key first to avoid borrow issues
+        let last_page_key = *self.page_ids.last().unwrap();
+        
+        // Track state outside the page access
+        let mut current_slot_count = 0;
+        let mut current_key = last_page_key;
+        let mut min_keys_to_add = Vec::new();
+        let mut new_page_keys = Vec::new();
+        
+        // Increment total length
+        self.total_len += kvs.len();
+        
+        // Process all KV pairs
+        for (i, (key, value)) in kvs.iter().enumerate() {
+            let key_ref = key.as_ref();
+            let value_ref = value.as_ref();
+            
+            // Get the current page
+            let mut current_page = self.write_page(&current_key);
+            
+            if i == 0 {
+                // Initialize slot count for the first iteration
+                current_slot_count = current_page.slot_count();
+            }
+            
+            // Try to append to the current page
+            if current_page.append(key_ref, value_ref) {
+                // If this is the first key in the page, remember it for later
+                if current_slot_count == 0 {
+                    min_keys_to_add.push(key_ref.to_vec());
                 }
-                Ok(())
+                
+                // Update slot count
+                current_slot_count += 1;
+                
+                // Release the page
+                drop(current_page);
             } else {
-                drop(last_page);
-                // Page overflow: create a new page
+                // Current page is full, release it
+                drop(current_page);
+                
+                // Create a new page
                 let mut new_page = self.mem_pool.create_new_page_for_write(self.c_key).unwrap();
                 new_page.init();
-
+                
                 let page_id = new_page.get_id();
                 let frame_id = new_page.frame_id();
-
-                // self.stats.inc_num_pages();
-
-                // Update the in-memory last key to the new page
+                
+                // Create a new page key
                 let new_key = PageFrameKey::new_with_frame_id(self.c_key, page_id, frame_id);
-                self.page_ids.push(new_key);
-
+                
+                // Add the new page key to our list to be added later
+                new_page_keys.push(new_key);
+                
+                // This is the first key in the page
+                min_keys_to_add.push(key_ref.to_vec());
+                
                 // Append the key-value pair to the new page
-                assert!(new_page.append(key, value));
-
-                self.min_keys.push(key.to_vec());
-                Ok(())
+                assert!(new_page.append(key_ref, value_ref));
+                
+                // Update tracking variables
+                current_key = new_key;
+                current_slot_count = 1;
+                
+                // Release the page
+                drop(new_page);
             }
-            storage.append(k.as_ref(), v.as_ref()).unwrap();
         }
-        storage
-        */
+        
+        // Now update our data structures with the collected information
+        self.page_ids.extend(new_page_keys);
+        self.min_keys.extend(min_keys_to_add);
+        
+        Ok(())
     }
 
     fn write_page(&self, page_key: &PageFrameKey) -> FrameWriteGuard {
@@ -513,7 +607,7 @@ impl<T: MemPool> SortedRunStoreRangeScanner<T> {
 /// there is no guaranteed ordering between different stores. The iterator handles this by always
 /// returning the smallest available key across all stores.
 pub struct BigSortedRunStore<T: MemPool> {
-    sorted_run_stores: Vec<Arc<SortedRunStore<T>>>,
+    pub sorted_run_stores: Vec<Arc<SortedRunStore<T>>>,
     first_keys: Vec<Vec<u8>>,
 }
 
