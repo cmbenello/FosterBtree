@@ -481,6 +481,64 @@ impl<T: MemPool> SortedRunStore<T> {
         }
     }
 
+
+
+    pub fn scan_range_arc(
+        this: &Arc<Self>,
+        lower_bound: &[u8],
+        upper_bound: &[u8],
+    ) -> SortedRunStoreRangeScanner<T> {
+        // --- find the first page that could contain `lower_bound` -------------
+        let start_page_index = if lower_bound.is_empty() {
+            0
+        } else {
+            // binary‑search in `min_keys`
+            let mut left = 0usize;
+            let mut right = this.min_keys.len();
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match this.min_keys[mid].as_slice().cmp(lower_bound) {
+                    std::cmp::Ordering::Less    => left  = mid + 1, // look to the right
+                    _ /* Equal | Greater */     => right = mid,     // mid could still work
+                }
+            }
+            if left == 0 { 0 } else { left - 1 }
+        };
+
+        // --- build the scanner -------------------------------------------------
+        SortedRunStoreRangeScanner {
+            storage:        Arc::clone(this),          // <‑‑ tiny & thread‑safe
+            lower_bound:    lower_bound.to_vec(),
+            upper_bound:    upper_bound.to_vec(),
+            current_page_index: start_page_index,
+            current_page:   None,
+            current_slot_id: 0,
+            is_init:        false,
+            is_done:        false,
+        }
+    }
+
+
+    pub fn scan_range_with_index<'a>(
+        &'a self,
+        lower_bound: &[u8],
+        upper_bound: &[u8],
+        start_page_index: usize,
+    ) -> SortedRunStoreRangeScanner<T> {
+        SortedRunStoreRangeScanner {
+            storage: Arc::new(self.clone()),
+            lower_bound: lower_bound.to_vec(),
+            upper_bound: upper_bound.to_vec(),
+            current_page_index: start_page_index,
+            current_page: None,
+            current_slot_id: 0,
+            is_done: false,
+            is_init: false,
+        }
+    }
+
+    
+
     /// Returns the total number of tuples stored in the `SortedRunStore`.
     ///
     /// This method iterates over all the pages in the run and sums up the number of
@@ -786,6 +844,61 @@ impl<T: MemPool> BigSortedRunStore<T> {
         BigSortedRunStoreScanner {
             scanners,
             current_values: vec![None; end_idx - start_idx],
+        }
+    }
+    
+
+    pub fn scan_range_arc(
+        this: &Arc<Self>,
+        lower_bound: &[u8],
+        upper_bound: &[u8],
+    ) -> BigSortedRunStoreScanner<T> {
+        // 1) find the slice of inner runs we must touch
+        let start_idx = if lower_bound.is_empty() {
+            0
+        } else {
+            let mut left = 0;
+            let mut right = this.first_keys.len();
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match this.first_keys[mid].as_slice().cmp(lower_bound) {
+                    std::cmp::Ordering::Less => left = mid + 1,
+                    _                         => right = mid,
+                }
+            }
+            if left == 0 { 0 } else { left - 1 }
+        };
+
+        let end_idx = if upper_bound.is_empty() {
+            this.first_keys.len()
+        } else {
+            let mut left = start_idx;
+            let mut right = this.first_keys.len();
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match this.first_keys[mid].as_slice().cmp(upper_bound) {
+                    std::cmp::Ordering::Less => left = mid + 1,
+                    _                         => right = mid,
+                }
+            }
+            left
+        };
+
+        // 2) build the per-run scanners
+        let scanners: Vec<_> = (start_idx..end_idx)
+            .map(|idx| {
+                let inner = Arc::clone(&this.sorted_run_stores[idx]);
+                SortedRunStore::scan_range_arc(&inner, lower_bound, upper_bound)
+            })
+            .collect();
+
+        // 3) allocate the current_values buffer _before_ moving `scanners`
+        let current_values = vec![None; scanners.len()];
+
+        // 4) now move both into the scanner
+        BigSortedRunStoreScanner {
+            scanners,
+            current_values,
         }
     }
 }
