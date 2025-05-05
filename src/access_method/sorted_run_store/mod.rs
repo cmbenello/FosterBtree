@@ -49,75 +49,6 @@ pub struct SortedRunStore<T: MemPool> {
 }
 
 impl<T: MemPool> SortedRunStore<T> {
-    /// Creates a new `SortedRunStore` from an iterator of key-value pairs.
-    ///
-    /// The key-value pairs should be provided in sorted order. The method partitions
-    /// the data into pages, ensuring that each page fits within the size constraints
-    /// and maintains the sorted order.
-    ///
-    /// # Arguments
-    ///
-    /// - `c_key`: The container key for identifying the storage container.
-    /// - `mem_pool`: Shared memory pool for managing pages.
-    /// - `iter`: An iterator over key-value pairs to store.
-    // pub fn new<K: AsRef<[u8]>, V: AsRef<[u8]>>(
-    //     c_key: ContainerKey,
-    //     mem_pool: Arc<T>,
-    //     iter: impl Iterator<Item = (K, V)>,
-    // ) -> Self {
-    //     let mut min_keys = Vec::new();    // Minimum keys for each page
-    //     let mut page_ids = Vec::new();    // IDs of the pages created
-    //     // Create a new page for writing
-    //     let mut current_page = mem_pool.create_new_page_for_write(c_key).unwrap();
-    //     current_page.init();              // Initialize the page
-    //     let root_key = {
-    //         let page_id = current_page.get_id();
-    //         let frame_id = current_page.frame_id();
-    //         PageFrameKey::new_with_frame_id(c_key, page_id, frame_id)
-    //     };
-    //     let mut first_key_in_page = None; // Keep track of the first key in the current page
-
-    //     let mut len = 0;
-    //     // Iterate over key-value pairs
-    //     for (key, value) in iter {
-    //         // Attempt to append the key-value pair to the current page
-    //         if current_page.append(key.as_ref(), value.as_ref()) {
-    //             // If successful and this is the first key in the page, record it
-    //             if first_key_in_page.is_none() {
-    //                 first_key_in_page = Some(key.as_ref().to_vec());
-    //             }
-    //         } else {
-    //             // If the page is full, finish the current page
-    //             min_keys.push(first_key_in_page.take().unwrap());
-    //             page_ids.push(current_page.get_id());
-
-    //             // Create a new page
-    //             drop(current_page); // Release the current page
-    //             current_page = mem_pool.create_new_page_for_write(c_key).unwrap();
-    //             current_page.init();
-    //             // Append the key-value pair to the new page (should succeed)
-    //             assert!(current_page.append(key.as_ref(), value.as_ref()));
-    //             first_key_in_page = Some(key.as_ref().to_vec());
-    //         }
-    //         len += 1;
-    //     }
-    //     // Finish the last page if there are any remaining keys
-    //     if let Some(first_key) = first_key_in_page {
-    //         min_keys.push(first_key);
-    //         page_ids.push(current_page.get_id());
-    //     }
-    //     drop(current_page); // Release the last page
-
-    //     // Return the new SortedRunStore
-    //     Self {
-    //         c_key,
-    //         mem_pool,
-    //         page_ids,
-    //         root_key,
-    //         total_len : len,
-    //         min_keys,
-    //     }
-    // }
 
     pub fn create(c_key: ContainerKey, mem_pool: Arc<T>) -> Self {
         // Create and initialize the first data page
@@ -359,7 +290,7 @@ impl<T: MemPool> SortedRunStore<T> {
                     // std::thread::sleep(Duration::from_nanos(base.pow(attempts)));
                     attempts += 1;
                 }
-                Err(e) => panic!("Error: {}", e),
+                Err(e) => panic!("Error getting page key {}: {}", page_key, e),
             }
         }
     }
@@ -647,8 +578,7 @@ impl<T: MemPool> SortedRunStoreRangeScanner<T> {
                 .storage
                 .mem_pool
                 .get_page_for_read(page_key)
-                .ok()
-                .unwrap();
+                .expect(&format!("Failed to get page for read {}", page_key));
             self.current_page = Some(unsafe {
                 std::mem::transmute::<FrameReadGuard<'_>, FrameReadGuard<'static>>(page)
             });

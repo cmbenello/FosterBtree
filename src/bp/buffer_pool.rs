@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     container::ContainerManager,
-    log_debug,
+    log_debug, log_error,
     page::{self, PageId},
     random::gen_random_int,
     rwlatch::RwLatch,
@@ -745,11 +745,31 @@ impl MemPool for BufferPool {
             if let Some(&index) = page_to_frame.get(&key.p_key()) {
                 let guard = frames[index].try_read();
                 self.release_shared();
-                return guard
-                    .inspect(|g| {
-                        g.evict_info().update();
-                    })
-                    .ok_or(MemPoolStatus::FrameReadLatchGrantFailed);
+                if let Some(guard) = guard{
+                    guard.evict_info().update();
+                    return Ok(guard)
+                }
+                else{
+                    log_error!( 
+                        "Page read latch is exclusive, this should not happen. Page: {:?} Frame: {:?}", 
+                        key.p_key(), 
+                        frames[index].frame_id
+                    );
+                    return Err(MemPoolStatus::FrameReadLatchGrantFailed);
+                }
+                // return Ok(guard
+                //     .inspect(|g| {
+                //         if g.buffer_frame.latch.is_exclusive(){
+                //             log_error!( 
+                //                 "Page read latch is exclusive, this should not happen. Page: {:?} Frame: {:?}", 
+                //                 key.p_key(), 
+                //                 g.buffer_frame.frame_id
+                //             )
+                //         }
+                //         g.evict_info().update();
+                //     })
+                //     // .ok_or(MemPoolStatus::FrameReadLatchGrantFailed);
+                //     .expect(&format!("FrameReadLatchGrantFailed {:?}", frames[index].latch)));
             }
             self.release_shared();
         }

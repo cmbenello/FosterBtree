@@ -15,8 +15,8 @@ use std::{
 type EvictionPolicyType = LRUEvictionPolicy;
 
 pub struct BufferFrame {
-    frame_id: u32, // An index of the frame in the buffer pool. This is a constant value.
-    latch: RwLatch,
+    pub frame_id: u32, // An index of the frame in the buffer pool. This is a constant value.
+    pub latch: RwLatch,
     is_dirty: AtomicBool, // Can be updated even when ReadGuard is held (see flush_all() in buffer_pool.rs)
     evict_info: EvictionPolicyType, // Can be updated even when ReadGuard is held (see get_page_for_read() in buffer_pool.rs). Interior mutability must be used.
     key: UnsafeCell<Option<PageKey>>, // Can only be updated when WriteGuard is held
@@ -92,7 +92,7 @@ impl BufferFrame {
 
 pub struct FrameReadGuard<'a> {
     upgraded: AtomicBool,
-    buffer_frame: &'a BufferFrame,
+    pub buffer_frame: &'a BufferFrame,
 }
 
 impl<'a> FrameReadGuard<'a> {
