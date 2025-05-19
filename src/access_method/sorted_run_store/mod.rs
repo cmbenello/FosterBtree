@@ -575,13 +575,8 @@ impl<T: MemPool> SortedRunStoreRangeScanner<T> {
             }
             let page_key = self.storage.page_ids[self.current_page_index];
             let page = self
-                .storage
-                .mem_pool
-                .get_page_for_read(page_key)
-                .expect(&format!("Failed to get page for read {}", page_key));
-            self.current_page = Some(unsafe {
-                std::mem::transmute::<FrameReadGuard<'_>, FrameReadGuard<'static>>(page)
-            });
+                .storage.read_page(page_key);
+            self.current_page = Some(page);
             self.current_slot_id = 0;
             self.is_init = true;
         }
