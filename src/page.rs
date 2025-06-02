@@ -103,6 +103,10 @@ impl Page {
     pub fn get_raw_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
+
+    pub fn c_key(&self) -> &[u8] {
+        &self.0[BASE_PAGE_HEADER_SIZE..]
+    }
 }
 
 struct BasePageHeader {

@@ -205,7 +205,7 @@ impl<T: MemPool> AppendOnlyStore<T> {
     }
 
     pub fn num_pages(&self) -> usize {
-        self.stats.get_num_pages()
+        1 + self.pages.read().unwrap().len()
     }
 
     pub fn append(&self, key: &[u8], value: &[u8]) -> Result<(), AccessMethodError> {

@@ -984,6 +984,10 @@ impl MemPool for BufferPool {
         self.release_exclusive();
         Ok(())
     }
+
+    fn capacity(&self) -> usize {
+        unsafe { &*self.frames.get() }.len()
+    }
 }
 
 #[cfg(test)]

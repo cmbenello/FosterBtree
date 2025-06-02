@@ -258,6 +258,10 @@ impl MemPool for InMemPool {
     fn fast_evict(&self, _frame_id: u32) -> Result<(), MemPoolStatus> {
         Ok(())
     }
+
+    fn capacity(&self) -> usize {
+        unsafe { &*self.frames.get() }.len()
+    }
 }
 
 #[cfg(test)]

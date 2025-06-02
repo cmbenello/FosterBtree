@@ -356,4 +356,7 @@ pub trait MemPool: Sync + Send {
 
     /// Reset the runtime statistics of the memory pool.
     fn reset_stats(&self);
+
+    /// Get the number of frames in the memory pool.
+    fn capacity(&self) -> usize;
 }
