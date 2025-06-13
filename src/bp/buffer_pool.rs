@@ -476,7 +476,7 @@ impl MemPool for BufferPool {
                         let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
                         // Remove the old mapping
                         if let Some(old_key) = victim.page_key() {
-                            page_to_frame.remove(old_key).unwrap(); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
+                            page_to_frame.remove(old_key); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
                         }
                         // Insert the new mapping
                         let container = self.container_manager.get_container(c_key);
@@ -528,7 +528,7 @@ impl MemPool for BufferPool {
                 // Remove the old mapping
                 for victim in victims.iter() {
                     if let Some(old_key) = victim.page_key() {
-                        page_to_frame.remove(old_key).unwrap(); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
+                        page_to_frame.remove(old_key); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
                     }
                 }
 
@@ -594,244 +594,178 @@ impl MemPool for BufferPool {
         keys
     }
 
-    fn get_page_for_write(&self, key: PageFrameKey) -> Result<FrameWriteGuard, MemPoolStatus> {
+    fn get_page_for_write(
+        &self,
+        key: PageFrameKey,
+    ) -> Result<FrameWriteGuard, MemPoolStatus> {
         log_debug!("Page write: {}", key);
         self.stats.inc_write_count();
-
-        #[cfg(not(feature = "no_bp_hint"))]
-        {
-            // Fast path access to the frame using frame_id
-            let frame_id = key.frame_id();
-            let frames = unsafe { &*self.frames.get() };
-            if (frame_id as usize) < frames.len() {
-                match frames[frame_id as usize].try_write(false) {
-                    Some(g) if g.page_key().map(|k| k == key.p_key()).unwrap_or(false) => {
-                        g.evict_info().update();
-                        g.dirty().store(true, Ordering::Release);
-                        log_debug!("Page fast path write: {}", key);
-                        return Ok(g);
-                    }
-                    _ => {}
-                }
-            }
-            // Failed due to one of the following reasons:
-            // 1. The page key does not match.
-            // 2. The page key is not set (empty frame).
-            // 3. The frame is latched.
-            // 4. The frame id is out of bounds.
-            log_debug!("Page fast path write failed{}", key);
-        }
-
-        // Critical section.
-        // 1. Check the page-to-frame mapping and get a frame index.
-        // 2. If the page is found, then try to acquire a write-latch, after which, the critical section ends.
-        // 3. If the page is not found, then a victim must be chosen to evict.
+    
+        // ── 1. Look up the page via the authoritative page-table ──────────
         {
             self.shared();
             let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-            let frames = unsafe { &mut *self.frames.get() };
-
-            if let Some(&index) = page_to_frame.get(&key.p_key()) {
-                let guard = frames[index].try_write(true);
-                self.release_shared(); // Critical section ends here
+            let frames        = unsafe { &mut *self.frames.get() };
+    
+            if let Some(&idx) = page_to_frame.get(&key.p_key()) {
+                let guard = frames[idx].try_write(true);
+                self.release_shared();
+    
                 return guard
                     .inspect(|g| {
                         g.evict_info().update();
+                        g.dirty().store(true, Ordering::Release);
                     })
                     .ok_or(MemPoolStatus::FrameWriteLatchGrantFailed);
             }
             self.release_shared();
         }
-
-        // Critical section.
-        // 1. Check the page-to-frame mapping and get a frame index.
-        // 2. If the page is found, then try to acquire a write-latch, after which, the critical section ends.
-        // 3. If the page is not found, then choose a victim and remove this mapping and insert the new mapping, after which, the critical section ends.
-        // 3.1. An optimization is to find a victim and handle IO outside the critical section.
-
-        // Before entering the critical section, we will find a frame that we can write to.
-        let mut victim = self.choose_victim().ok_or(MemPoolStatus::CannotEvictPage)?;
-        self.write_victim_to_disk_if_dirty_w(&victim).unwrap();
-        // Now we have a clean victim that can be used for writing.
-        assert!(!victim.dirty().load(Ordering::Acquire));
-
-        // Start the critical section.
+    
+        // ── 2. Page miss → select a free/evictable frame ──────────────────
+        let mut victim = self
+            .choose_victim()
+            .ok_or(MemPoolStatus::CannotEvictPage)?;
+        self.write_victim_to_disk_if_dirty_w(&victim)?;
+    
+        // ── 3. Enter critical-section to update page-table ────────────────
         {
             self.exclusive();
-
             let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-            let frames = unsafe { &mut *self.frames.get() };
+            let frames        = unsafe { &mut *self.frames.get() };
+    
             match page_to_frame.get(&key.p_key()) {
-                Some(&index) => {
-                    // Unlikely path as it is already checked in the critical section above with the shared latch.
-                    let guard = frames[index].try_write(true);
+                // (rare) someone raced us and loaded the page
+                Some(&idx) => {
+                    let guard = frames[idx].try_write(true);
                     self.release_exclusive();
-
-                    self.eviction_hints.push(index).unwrap();
-                    drop(victim); // Release the write latch on the unused victim
-
-                    guard
-                        .inspect(|g| {
-                            g.evict_info().update();
-                        })
-                        .ok_or(MemPoolStatus::FrameWriteLatchGrantFailed)
+                    self.eviction_hints.push(idx).unwrap();
+                    drop(victim);
+    
+                    return guard
+                        .inspect(|g| g.evict_info().update())
+                        .ok_or(MemPoolStatus::FrameWriteLatchGrantFailed);
                 }
+                // normal path
                 None => {
-                    // Likely path as the page has not been found in the page_to_frame mapping.
-                    // Remove the victim from the page_to_frame mapping
-                    if let Some(old_key) = victim.page_key() {
-                        page_to_frame.remove(old_key).unwrap();
-                        // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
+                    if let Some(old) = victim.page_key() {
+                        page_to_frame.remove(old).unwrap();
                     }
-                    // Insert the new mapping
                     page_to_frame.insert(key.p_key(), victim.frame_id() as usize);
-
                     self.release_exclusive();
-
-                    // Read the wanted page from disk.
-                    let container = self.container_manager.get_container(key.p_key().c_key);
-                    container
-                        .read_page(key.p_key().page_id, &mut victim)
-                        .map(|()| {
-                            victim.page_key_mut().replace(key.p_key());
-                            victim.evict_info().reset();
-                            victim.evict_info().update();
-                        })?;
-                    victim.dirty().store(true, Ordering::Release); // Prepare the page for writing.
-                    Ok(victim)
                 }
             }
         }
+    
+        // ── 4. Read page bytes from disk, return write-latched frame ──────
+        let container = self.container_manager.get_container(key.p_key().c_key);
+        container.read_page(key.p_key().page_id, &mut victim)?;
+        victim.page_key_mut().replace(key.p_key());
+        victim.evict_info().reset();
+        victim.evict_info().update();
+        victim.dirty().store(true, Ordering::Release);
+    
+        Ok(victim)
     }
 
     fn get_page_for_read(&self, key: PageFrameKey) -> Result<FrameReadGuard, MemPoolStatus> {
-        log_debug!("Page read: {}", key);
-        self.stats.inc_read_count();
-
+        use crate::bp::MemPoolStatus;
+        use std::{thread, time::Duration};
+    
+        /* ───────────────────────── fast-path via frame-id ─────────────────── */
         #[cfg(not(feature = "no_bp_hint"))]
         {
-            // Fast path access to the frame using frame_id
-            let frame_id = key.frame_id();
-            let frames = unsafe { &*self.frames.get() };
-            if (frame_id as usize) < frames.len() {
-                let guard = frames[frame_id as usize].try_read();
-                match guard {
-                    Some(g) if g.page_key().map(|k| k == key.p_key()).unwrap_or(false) => {
-                        // Update the eviction info
+            let frame_id = key.frame_id() as usize;
+            let frames   = unsafe { &*self.frames.get() };
+            if frame_id < frames.len() {
+                if let Some(g) = frames[frame_id].try_read() {
+                    if g.page_key().map_or(false, |k| k == key.p_key()) {
                         g.evict_info().update();
-                        log_debug!("Page fast path read: {}", key);
                         return Ok(g);
                     }
-                    _ => {}
                 }
             }
-            // Failed due to one of the following reasons:
-            // 1. The page key does not match.
-            // 2. The page key is not set (empty frame).
-            // 3. The frame is latched.
-            // 4. The frame id is out of bounds.
-            log_debug!("Page fast path read failed: {}", key);
-        };
-
-        // Critical section.
-        // 1. Check the page-to-frame mapping and get a frame index.
-        // 2. If the page is found, then try to acquire a read-latch, after which, the critical section ends.
-        // 3. If the page is not found, then a victim must be chosen to evict.
+        }
+    
+        /* ───────────────────── try mapping with shared latch ──────────────── */
         {
             self.shared();
-            let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-            let frames = unsafe { &mut *self.frames.get() };
-
-            if let Some(&index) = page_to_frame.get(&key.p_key()) {
-                let guard = frames[index].try_read();
+            let mapping = unsafe { &*self.page_to_frame.get() };
+            let frames  = unsafe { &*self.frames.get() };
+    
+            if let Some(&idx) = mapping.get(&key.p_key()) {
+                let guard = frames[idx].try_read();
                 self.release_shared();
-                if let Some(guard) = guard{
-                    guard.evict_info().update();
-                    return Ok(guard)
-                }
-                else{
-                    log_error!( 
-                        "Page read latch is exclusive, this should not happen. Page: {:?} Frame: {:?}", 
-                        key.p_key(), 
-                        frames[index].frame_id
-                    );
+    
+                if let Some(g) = guard {
+                    g.evict_info().update();
+                    return Ok(g);
+                } else {
                     return Err(MemPoolStatus::FrameReadLatchGrantFailed);
                 }
-                // return Ok(guard
-                //     .inspect(|g| {
-                //         if g.buffer_frame.latch.is_exclusive(){
-                //             log_error!( 
-                //                 "Page read latch is exclusive, this should not happen. Page: {:?} Frame: {:?}", 
-                //                 key.p_key(), 
-                //                 g.buffer_frame.frame_id
-                //             )
-                //         }
-                //         g.evict_info().update();
-                //     })
-                //     // .ok_or(MemPoolStatus::FrameReadLatchGrantFailed);
-                //     .expect(&format!("FrameReadLatchGrantFailed {:?}", frames[index].latch)));
             }
             self.release_shared();
         }
-
-        // Critical section.
-        // 1. Check the page-to-frame mapping and get a frame index.
-        // 2. If the page is found, then try to acquire a read-latch, after which, the critical section ends.
-        // 3. If the page is not found, then choose a victim and remove this mapping and insert the new mapping, after which, the critical section ends.
-        // 3.1. An optimization is to find a victim and handle IO outside the critical section.
-
-        // Before entering the critical section, we will find a frame that we can read from.
-        let mut victim = self.choose_victim().ok_or(MemPoolStatus::CannotEvictPage)?;
-        if victim.dirty().load(Ordering::Acquire) {
-            self.stats.inc_read_request_waiting_for_write_count();
-        }
-        self.write_victim_to_disk_if_dirty_w(&victim).unwrap();
-        // Now we have a clean victim that can be used for reading.
-        assert!(!victim.dirty().load(Ordering::Acquire));
-
-        // Start the critical section.
-        {
-            self.exclusive();
-
-            let page_to_frame = unsafe { &mut *self.page_to_frame.get() };
-            let frames = unsafe { &mut *self.frames.get() };
-            match page_to_frame.get(&key.p_key()) {
-                Some(&index) => {
-                    // Unlikely path as it is already checked in the critical section above with the shared latch.
-                    let guard = frames[index].try_read();
-                    self.release_exclusive();
-
-                    self.eviction_hints.push(index).unwrap();
-                    drop(victim); // Release the write latch on the unused victim
-
-                    guard
-                        .inspect(|g| {
-                            g.evict_info().update();
-                        })
-                        .ok_or(MemPoolStatus::FrameReadLatchGrantFailed)
+    
+        /* ───────────────────── no frame yet → need a victim ───────────────── */
+        let mut backoff = Duration::from_micros(10);
+    
+        loop {
+            // 1. find a victim we can write-latch
+            let mut victim = match self.choose_victim() {
+                Some(v) => v,
+                None    => {                        // all latched → yield & retry
+                    thread::yield_now();
+                    continue;
                 }
-                None => {
-                    // Likely path as the page has not been found in the page_to_frame mapping.
-                    // Remove the victim from the page_to_frame mapping
-                    if let Some(old_key) = victim.page_key() {
-                        page_to_frame.remove(old_key).unwrap(); // Unwrap is safe because victim's write latch is held. No other thread can remove the old key from page_to_frame before this thread.
-                    }
-                    // Insert the new mapping
-                    page_to_frame.insert(key.p_key(), victim.frame_id() as usize);
-
+            };
+    
+            // 2. flush if dirty; ignore empty frames
+            self.write_victim_to_disk_if_dirty_w(&victim)?;
+    
+            // 3. enter critical section to (re)check mapping & possibly claim victim
+            self.exclusive();
+            let mapping = unsafe { &mut *self.page_to_frame.get() };
+            let frames  = unsafe { &mut *self.frames.get() };
+    
+            match mapping.get(&key.p_key()) {
+                /* someone else loaded the page while we worked → switch to it */
+                Some(&idx) => {
                     self.release_exclusive();
-
-                    let container = self.container_manager.get_container(key.p_key().c_key);
-                    container
-                        .read_page(key.p_key().page_id, &mut victim)
-                        .map(|()| {
-                            victim.page_key_mut().replace(key.p_key());
-                            victim.evict_info().reset();
-                            victim.evict_info().update();
-                        })?;
-                    Ok(victim.downgrade())
+                    self.eviction_hints.push(victim.frame_id() as usize).ok();
+                    drop(victim);                       // release unused victim
+    
+                    if let Some(g) = frames[idx].try_read() {
+                        g.evict_info().update();
+                        return Ok(g);
+                    } else {
+                        return Err(MemPoolStatus::FrameReadLatchGrantFailed);
+                    }
+                }
+    
+                /* mapping still absent → claim `victim` for our page */
+                None => {
+                    // remove victim’s old mapping, but only if it had one
+                    if let Some(old_key) = victim.page_key() {
+                        mapping.remove(old_key);
+                    }
+                    mapping.insert(key.p_key(), victim.frame_id() as usize);
+                    self.release_exclusive();
+    
+                    // 4. perform disk I/O outside the CS
+                    let container =
+                        self.container_manager.get_container(key.p_key().c_key);
+                    container.read_page(key.p_key().page_id, &mut victim)?;
+                    victim.page_key_mut().replace(key.p_key());
+                    victim.evict_info().reset();
+                    victim.evict_info().update();
+    
+                    return Ok(victim.downgrade());
                 }
             }
+    
+            // (only reached on latch-contention) – back-off a little
+            thread::sleep(backoff);
+            backoff = backoff.saturating_mul(2).min(Duration::from_millis(5));
         }
     }
 

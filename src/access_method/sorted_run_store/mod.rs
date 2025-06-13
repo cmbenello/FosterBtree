@@ -234,23 +234,38 @@ pub fn new<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     }
 
     fn read_page(&self, page_key: PageFrameKey) -> FrameReadGuard<'static> {
-        let base: u64 = 2;
-        let mut attempts = 0;
+        use crate::bp::MemPoolStatus;
+        use std::{thread, time::Duration};
+    
+        // start with 5 µs and double on every full retry cycle, capped at 5 ms
+        let mut backoff = Duration::from_micros(5);
+    
         loop {
             match self.mem_pool.get_page_for_read(page_key) {
-                Ok(page) => {
+                // ── success ─────────────────────────────────────────────────────
+                Ok(pg) => {
+                    // extend lifetime – the scanner keeps the guard until it
+                    // moves on to the next page
                     return unsafe {
-                        std::mem::transmute::<FrameReadGuard, FrameReadGuard<'static>>(page)
-                    }
+                        std::mem::transmute::<FrameReadGuard, FrameReadGuard<'static>>(pg)
+                    };
                 }
+    
+                // ── latch contention – tiny spin / yield and retry ─────────────
                 Err(MemPoolStatus::FrameReadLatchGrantFailed) => {
-                    std::thread::sleep(Duration::from_nanos(base.pow(attempts)));
-                    attempts += 1;
+                    thread::yield_now();
                 }
+    
+                // ── buffer pool is out of free frames – short yield and retry ──
                 Err(MemPoolStatus::CannotEvictPage) => {
-                    std::thread::yield_now();     // give writers a chance, then retry
+                    thread::yield_now();
                 }
-                Err(e) => panic!("Error getting page key {}: {}", page_key, e),
+    
+                // ── any other error (incl. unexpected I/O) – exponential back-off
+                Err(_) => {
+                    thread::sleep(backoff);
+                    backoff = backoff.saturating_mul(2).min(Duration::from_millis(5));
+                }
             }
         }
     }
@@ -450,6 +465,24 @@ pub fn new<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     pub fn num_pages(&self) -> usize {
         self.page_ids.len()
     }
+
+    pub fn overlaps_range(&self, lower: &[u8], upper: &[u8]) -> bool {
+        if self.min_keys.is_empty() { return false; }
+    
+        let run_min = self.min_keys[0].as_slice();
+    
+        // --- grab *last* key from the last page -----------------------------------
+        let last_pg_key  = *self.page_ids.last().unwrap();
+        let last_pg      = self.read_page(last_pg_key);
+        let slots        = last_pg.slot_count();
+        if slots == 0 { return false; }                             // defensive
+    
+        let (run_max, _) = last_pg.get(slots - 1);                  // ← fixed
+    
+        // closed-vs-half-open interval overlap test
+        (upper.is_empty() || run_min <  upper) &&
+        (lower.is_empty() || lower    <= run_max)
+    }
 }
 
 impl<T: MemPool> Clone for SortedRunStore<T> {
@@ -480,66 +513,121 @@ impl<'a, T: MemPool> Iterator for SortedRunStoreRangeScanner<T> {
     type Item = (Vec<u8>, Vec<u8>); // Returns key-value pairs as (Vec<u8>, Vec<u8>)
 
     fn next(&mut self) -> Option<Self::Item> {
+        /* ─── fast-path ───────────────────────────────────────────────────── */
         if self.is_done {
             return None;
         }
+
+        /* ─── first call: position scanner on the first relevant page ────── */
         if !self.is_init {
             self.initialize();
+            if self.is_done {
+                return self.finish();
+            }
         }
+
+        /* ─── main loop ───────────────────────────────────────────────────── */
         loop {
-            let page = self.current_page.as_ref().unwrap();
-            while self.current_slot_id < page.slot_count() {
-                let (key, value) = page.get(self.current_slot_id);
-                self.current_slot_id += 1;
+            /* ---------- consume tuples from the current page --------------- */
+            {
+                let page = self.current_page.as_ref().unwrap();
 
-                // Lower bound: key must be >= lower_bound
-                if key < self.lower_bound.as_slice() {
-                    // keep searching
-                    continue;
-                }
+                while self.current_slot_id < page.slot_count() {
+                    let (key, val) = page.get(self.current_slot_id);
+                    self.current_slot_id += 1;
 
-                // **Upper bound: key must be < upper_bound** (always half-open)
-                if !self.upper_bound.is_empty() {
-                    if key >= self.upper_bound.as_slice() {
-                        // This key is outside our range, so we can stop this iteration
-                        return None;
+                    /* lower bound (inclusive) */
+                    if !self.lower_bound.is_empty()
+                        && key < self.lower_bound.as_slice()
+                    {
+                        continue;
                     }
-                }
 
-                // Key is within [lower_bound, upper_bound), so yield it
-                return Some((key.to_vec(), value.to_vec()));
+                    /* upper bound (exclusive) */
+                    if !self.upper_bound.is_empty()
+                        && key >= self.upper_bound.as_slice()
+                    {
+                        return self.finish();
+                    }
+
+                    return Some((key.to_vec(), val.to_vec()));
+                }
             }
 
-            // If we exhaust this page, move on to the next
+            /* ---------- page exhausted → un-pin & evict frame -------------- */
+            if let Some(pg) = self.current_page.take() {
+                let fid = pg.frame_id();
+                drop(pg);
+                let _ = self.storage.mem_pool.fast_evict(fid);
+            }
+
+            /* ---------- advance to next page or finish --------------------- */
             self.current_page_index += 1;
             if self.current_page_index >= self.storage.page_ids.len() {
-                // Done
-                self.is_done = true;
-                return None;
-            } else {
-                let next_page_id = self.storage.page_ids[self.current_page_index];
-                let next_page = self.storage.read_page(next_page_id);
-                self.current_page = Some(next_page);
-                self.current_slot_id = 0;
+                return self.finish();
             }
+
+            let next_key = self.storage.page_ids[self.current_page_index];
+            self.current_page = Some(self.storage.read_page(next_key));
+            self.current_slot_id = 0;
         }
     }
 }
 
 impl<T: MemPool> SortedRunStoreRangeScanner<T> {
     pub fn initialize(&mut self) {
-        // If current_page is empty, move to the next page
-        if self.current_page.is_none() {
-            if self.current_page_index >= self.storage.page_ids.len() {
-                panic!("exceeded capacity");
-            }
-            let page_key = self.storage.page_ids[self.current_page_index];
-            let page = self
-                .storage.read_page(page_key);
-            self.current_page = Some(page);
-            self.current_slot_id = 0;
-            self.is_init = true;
+        if self.is_init { return; }
+        self.is_init = true;
+    
+        // nothing to scan?
+        if self.current_page_index >= self.storage.page_ids.len() {
+            self.is_done = true;
+            return;
         }
+    
+        // first page
+        let mut pg = self.storage
+            .read_page(self.storage.page_ids[self.current_page_index]);
+    
+        // fast-forward while whole page < lower_bound
+        while !self.lower_bound.is_empty() {
+            let slots = pg.slot_count();
+            if slots == 0 { break; }
+    
+            let (last_key, _) = pg.get(slots - 1);
+            if last_key < self.lower_bound.as_slice() {
+                // --- page not needed → unpin & evict it NOW ---------------------
+                let fid = pg.frame_id();
+                drop(pg);
+                let _ = self.storage.mem_pool.fast_evict(fid);
+    
+                // move to next page (or bail out)
+                self.current_page_index += 1;
+                if self.current_page_index >= self.storage.page_ids.len() {
+                    self.is_done = true;
+                    return;
+                }
+                pg = self.storage
+                    .read_page(self.storage.page_ids[self.current_page_index]);
+                continue;
+            }
+            break;
+        }
+    
+        self.current_page    = Some(pg);
+        self.current_slot_id = 0;
+    }
+
+    #[inline]
+    fn finish(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if !self.is_done {
+            self.is_done = true;
+            // drop any still-pinned page
+            if let Some(pg) = self.current_page.take() { drop(pg); }
+            // evict everything that belongs to this run’s container
+            let _ = self.storage.mem_pool.drop_container(self.storage.c_key);
+        }
+        None
     }
 }
 
@@ -785,6 +873,27 @@ impl<T: MemPool> BigSortedRunStore<T> {
             scanners,
             current_values,
         }
+    }
+    
+    pub fn overlaps_range(&self, lower: &[u8], upper: &[u8]) -> bool {
+        if self.sorted_run_stores.is_empty() {
+            return false;
+        }
+    
+        // ------ global minimum key --------------------------------------------
+        let run_min = self.first_keys[0].as_slice();
+    
+        // ------ global maximum key (last tuple of last page of last run) -------
+        let last_run      = self.sorted_run_stores.last().unwrap();
+        let last_pg_key   = *last_run.page_ids.last().unwrap();
+        let last_pg       = last_run.read_page(last_pg_key);
+        let slots         = last_pg.slot_count();
+        if slots == 0 { return false; }                                // defensive
+        let (run_max, _) = last_pg.get(slots - 1);
+    
+        // ------ closed-vs-half-open interval overlap test ---------------------
+        (upper.is_empty()  || run_min <  upper) &&
+        (lower.is_empty()  || lower    <= run_max)
     }
 }
 

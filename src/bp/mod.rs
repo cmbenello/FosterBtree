@@ -1,5 +1,5 @@
 mod buffer_frame;
-mod buffer_pool;
+pub mod buffer_pool;
 mod eviction_policy;
 mod in_mem_pool;
 mod mem_pool_trait;
