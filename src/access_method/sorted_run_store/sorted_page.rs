@@ -212,34 +212,47 @@ impl SortedPage for Page {
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) -> bool {
-        let rec_len   = key.len() + value.len();
-        let new_slots = self.slot_count() as usize + 1;
-    
-        // *** real free space is the gap between next slot and next record ***
-        let low_water = PAGE_HEADER_SIZE + new_slots * SLOT_SIZE;
-        let high_water = self.rec_start_offset() as usize;
-    
+        /* ---------- phase 0: cheap size check -------------------------------- */
+        let rec_len   = key.len() + value.len();             // bytes in record
+        let new_slots = self.slot_count() as usize + 1;      // +1 slot after insert
+
+        // real free space is the gap between the next slot we would write
+        // and the first byte currently used by records
+        let low_water  = PAGE_HEADER_SIZE + new_slots * SLOT_SIZE;
+        let high_water = self.rec_start_offset() as usize;   // == first byte of record area
+
         if rec_len + SLOT_SIZE > high_water.saturating_sub(low_water) {
-            return false;                   // not enough *contiguous* room
+            return false;            // not enough contiguous space – page unchanged
         }
-    
-        // safe to allocate
+
+        /* ---------- phase 1: copy record ------------------------------------ */
+        // NB: high_water ≥ low_water ⇒ subtraction is safe
         let new_rec_start = (high_water - rec_len) as u32;
-    
-        // copy record
-        self[new_rec_start as usize .. new_rec_start as usize + key.len()]
+
+        // write key
+        self[new_rec_start as usize
+             .. new_rec_start as usize + key.len()]
             .copy_from_slice(key);
-        self[new_rec_start as usize + key.len() ..
-             new_rec_start as usize + rec_len]
+
+        // write value
+        self[new_rec_start as usize + key.len()
+             .. new_rec_start as usize + rec_len]
             .copy_from_slice(value);
-    
-        // write slot and update header fields
+
+        /* ---------- phase 2: write slot + header bookkeeping ---------------- */
+        // slot goes *after* any existing slots → position == old slot_count
         let slot = Slot::new(new_rec_start, key.len() as u32, value.len() as u32);
-        self.insert_slot(self.slot_count(), &slot);
-    
+        self.insert_slot(self.slot_count(), &slot);          // bumps slot_count + bytes-used
+
+        // rec-start moved upward
         self.set_rec_start_offset(new_rec_start);
+
+        // total_bytes_used already bumped by insert_slot (for SLOT_SIZE)
+        // add record payload now
         self.set_total_bytes_used(self.total_bytes_used() + rec_len as u32);
-    
+
+        debug_assert!(self.total_bytes_used() as usize       // ← *very* cheap in release
+                      <= AVAILABLE_PAGE_SIZE);
         true
     }
 
