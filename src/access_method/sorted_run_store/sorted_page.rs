@@ -212,27 +212,35 @@ impl SortedPage for Page {
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) -> bool {
-        let total_len = key.len() + value.len();
-        if self.total_free_space() < SLOT_SIZE as u32 + total_len as u32 {
-            false
-        } else {
-            let insert_pos = self.slot_count();
-
-            let rec_start_offset = self.rec_start_offset() - total_len as u32;
-            self[rec_start_offset as usize..rec_start_offset as usize + key.len()]
-                .copy_from_slice(key);
-            self[rec_start_offset as usize + key.len()..rec_start_offset as usize + total_len]
-                .copy_from_slice(value);
-
-            let slot = Slot::new(rec_start_offset, key.len() as u32, value.len() as u32);
-            self.insert_slot(insert_pos, &slot);
-
-            // Update the total bytes used
-            let new_total_bytes_used = self.total_bytes_used() + total_len as u32;
-            self.set_total_bytes_used(new_total_bytes_used);
-
-            true
+        let rec_len   = key.len() + value.len();
+        let new_slots = self.slot_count() as usize + 1;
+    
+        // *** real free space is the gap between next slot and next record ***
+        let low_water = PAGE_HEADER_SIZE + new_slots * SLOT_SIZE;
+        let high_water = self.rec_start_offset() as usize;
+    
+        if rec_len + SLOT_SIZE > high_water.saturating_sub(low_water) {
+            return false;                   // not enough *contiguous* room
         }
+    
+        // safe to allocate
+        let new_rec_start = (high_water - rec_len) as u32;
+    
+        // copy record
+        self[new_rec_start as usize .. new_rec_start as usize + key.len()]
+            .copy_from_slice(key);
+        self[new_rec_start as usize + key.len() ..
+             new_rec_start as usize + rec_len]
+            .copy_from_slice(value);
+    
+        // write slot and update header fields
+        let slot = Slot::new(new_rec_start, key.len() as u32, value.len() as u32);
+        self.insert_slot(self.slot_count(), &slot);
+    
+        self.set_rec_start_offset(new_rec_start);
+        self.set_total_bytes_used(self.total_bytes_used() + rec_len as u32);
+    
+        true
     }
 
     fn get(&self, slot_id: u32) -> (&[u8], &[u8]) {
